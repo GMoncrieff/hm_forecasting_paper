@@ -4,6 +4,7 @@ Bodies are ported from the standalone plot_*.py scripts; the shared global-map /
 inset scaffolding (Figs 2, S1-S4) is delegated to utils, while Fig 3's
 categorical map and Figs 8/9's RGB map keep their own verbatim bodies.
 """
+from pathlib import Path
 import numpy as np
 import xarray as xr
 import rioxarray as rxr

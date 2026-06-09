@@ -104,6 +104,15 @@ is downloaded on first use). An internet connection is required for those three.
 
 Figure bodies were ported from the standalone `plot_*.py` scripts (themselves
 extracted from the original plotting notebooks). Shared scaffolding was factored into
-`utils.py` and parameters into `config.py` without changing visual output: Figs 2, 3,
-S1, 8, 9, S5, and S6 were verified pixel-identical against the originals where input
-data was available.
+`utils.py` and parameters into `config.py` without changing visual output. Verified
+**pixel-identical** against the originals (where input data was available): Figs 2, 3,
+S1, 8, S5, S6, 10 (all four panels), and the Tables S2–S9 stats CSV. Figure 9's map +
+legend are produced by the byte-identical ternary code; the original standalone script
+cannot generate a reference for them because its per-figure Dask client OOMs on the
+~8 GB transform (`KilledWorker`) — the refactor drops that per-figure client and
+computes in-process, so Fig 9 now renders reliably.
+
+A few small, output-neutral cleanups were made during the port: the broken/redundant
+`raster_classes.tif` re-export at the end of the Fig 2/3 notebook was dropped, and the
+per-figure Dask `Client()` calls were removed (the default scheduler gives identical
+results).
