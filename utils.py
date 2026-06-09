@@ -16,7 +16,7 @@ from scipy.stats import beta
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.path as mpath
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, Polygon
 from matplotlib.colors import ListedColormap
 import cartopy.crs as ccrs
 import hvplot.xarray  # noqa: F401  (registers the .hvplot accessor)
@@ -323,3 +323,93 @@ def add_circular_insets(fig, ax, pds, *, cmap, vmin, vmax):
         ax.plot(x_loc, y_loc, 'o', color='black', markersize=4,
                 markerfacecolor='none', markeredgewidth=0.4,
                 transform=ax.transData, zorder=10)
+
+
+def plot_ternary_alpha_legend(out_path,
+                              n_bins=config.TERNARY_N_BINS,
+                              colors=_TERNARY_COLORS,
+                              labels=config.TERNARY_LABELS,
+                              background=_BACKGROUND_RGB,
+                              alpha_levels=config.ALPHA_LEVELS,
+                              base_alpha=config.BASE_ALPHA,
+                              transparent_q=config.TRANSPARENT_Q):
+    """Figure 9 colour key: full-opacity ternary hue triangle above an opacity bar."""
+    h = np.sqrt(3) / 2.0
+
+    def bary2xy(b):
+        return (b[1] * 0.5 + b[2], b[1] * h)
+
+    fig = plt.figure(figsize=(6.2, 7.2))
+    gs = fig.add_gridspec(2, 1, height_ratios=[6.0, 1.0], hspace=0.12)
+    ax = fig.add_subplot(gs[0])
+    axbar = fig.add_subplot(gs[1])
+
+    for up in (True, False):
+        tot = n_bins - 1 if up else n_bins - 2
+        for i in range(tot + 1):
+            for j in range(tot - i + 1):
+                k = tot - i - j
+                if up:
+                    vb = [(i + 1, j, k), (i, j + 1, k), (i, j, k + 1)]
+                    c = np.array([3 * i + 1, 3 * j + 1, 3 * k + 1], dtype=np.float32) / (3 * n_bins)
+                else:
+                    vb = [(i + 1, j + 1, k), (i + 1, j, k + 1), (i, j + 1, k + 1)]
+                    c = np.array([3 * i + 2, 3 * j + 2, 3 * k + 2], dtype=np.float32) / (3 * n_bins)
+                col = np.clip(c @ colors, 0, 1)
+                verts = [bary2xy(np.array(v, dtype=float) / n_bins) for v in vb]
+                ax.add_patch(Polygon(verts, closed=True, facecolor=tuple(col),
+                                     edgecolor='white', linewidth=0.6))
+
+    ax.add_patch(Polygon([(0, 0), (1, 0), (0.5, h)], closed=True,
+                         edgecolor='black', facecolor='none', linewidth=2.0))
+    lab = dict(fontsize=16, fontweight='bold')
+    ax.text(-0.06, -0.05, labels[0], color=tuple(colors[0]), ha='right', va='top', **lab)
+    ax.text(0.5, h + 0.06, labels[1], color=tuple(colors[1]), ha='center', va='bottom', **lab)
+    ax.text(1.06, -0.05, labels[2], color=tuple(colors[2]), ha='left', va='top', **lab)
+    centre = np.array([0.5, h / 3.0])
+    corners = [np.array([0.0, 0.0]), np.array([0.5, h]), np.array([1.0, 0.0])]
+    for s, e in [(corners[0], corners[1]), (corners[1], corners[2]), (corners[2], corners[0])]:
+        for f in (0.25, 0.50, 0.75):
+            pt = s + f * (e - s)
+            d = pt - centre
+            d = d / np.linalg.norm(d)
+            tx, ty = pt + 0.04 * d
+            ax.text(tx, ty, f"{int(f * 100)}", fontsize=9, ha='center', va='center')
+    ax.set_xlim(-0.22, 1.22)
+    ax.set_ylim(-0.18, h + 0.22)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    ax.set_title("Hue  =  which dataset dominates", fontsize=12, pad=2)
+
+    n_lv = len(alpha_levels)
+    q0 = transparent_q * 100.0
+    width = (100.0 - q0) / n_lv
+    Nx = 600
+    xs = np.linspace(0, 100, Nx)
+    A = np.full(Nx, base_alpha, dtype=float)
+    for li, a in enumerate(alpha_levels):
+        A[(xs >= q0 + li * width) & (xs <= q0 + (li + 1) * width)] = a
+    ink = np.array([0.16, 0.16, 0.19])
+    bar = A[:, None] * ink + (1 - A[:, None]) * background
+    axbar.imshow(bar[None, :, :], extent=[0, 100, 0, 1], aspect='auto', origin='lower',
+                 interpolation='nearest')
+    for li in range(n_lv + 1):
+        axbar.axvline(q0 + li * width, color='white', lw=0.8)
+    axbar.axvline(q0, color='black', lw=1.6)
+    axbar.add_patch(Polygon([(0, 0), (100, 0), (100, 1), (0, 1)], closed=True,
+                            fill=False, edgecolor='black', lw=1.0))
+    axbar.set_xlim(0, 100)
+    axbar.set_ylim(0, 1)
+    axbar.set_yticks([])
+    axbar.set_xticks([0, int(q0), 100])
+    axbar.set_xticklabels(['0', f'{int(q0)}', '100'])
+    for sp in axbar.spines.values():
+        sp.set_visible(False)
+    axbar.set_xlabel(
+        "Opacity  =  magnitude percentile of max(ESRI, HM, CPI)\n"
+        f"≤ {int(q0)}th pct → transparent      ·      top {int(100 - q0)}% → "
+        f"{n_lv} equal-count bins, rising to opaque",
+        fontsize=9)
+
+    fig.savefig(out_path, dpi=config.DPI_PLOT, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
