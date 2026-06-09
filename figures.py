@@ -7,8 +7,10 @@ categorical map and Figs 8/9's RGB map keep their own verbatim bodies.
 import numpy as np
 import xarray as xr
 import rioxarray as rxr
+import pandas as pd
 import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import matplotlib.path as mpath
 from matplotlib.patches import Circle
 from matplotlib.colors import ListedColormap
@@ -17,6 +19,7 @@ import holoviews as hv
 
 import config
 import utils
+from utils import fetch_esri_satellite, fmt_coord
 
 OUT = config.OUTPUT_DIR
 
@@ -332,3 +335,790 @@ def figS1_S4():
         utils.add_circular_insets(fig, ax, pds, cmap='my_custom_coolwarm',
                                   vmin=config.CLIM[0], vmax=config.CLIM[1])
         fig.savefig(OUT / fname, dpi=config.DPI_MAP, bbox_inches='tight')
+
+
+def fig4_5():
+    OUT.mkdir(parents=True, exist_ok=True)
+    # ------------------------------------------------------------------
+    # Data (shared by Figure 4 and Figure 5)
+    # ------------------------------------------------------------------
+    # load HM data
+    ds_obs2000 = rxr.open_rasterio(config.PATHS['hm_2000_aa'], chunks='auto')
+    ds_obs = rxr.open_rasterio(config.PATHS['hm_2020_aa'], chunks='auto')
+
+    ds_pred = rxr.open_rasterio(config.PATHS['pred_2020_central'], chunks='auto')
+
+    ds_obsdiff = ds_obs - ds_obs2000
+    ds_preddiff = ds_pred - ds_obs2000
+
+    ds_diff = xr.Dataset({
+        'obs': ds_obsdiff,
+        'pred': ds_preddiff
+    })
+    print(ds_diff)
+
+    #lodd mask data
+    splitmask = rxr.open_rasterio(config.PATHS['split_mask'])
+    print(splitmask)
+
+    #mask to where split == 2 (validation set)
+    val_mask = splitmask.isel(band=0) == 2
+    ds_diff_masked = ds_diff.where(val_mask, drop=False)
+
+    # Flatten and drop NaNs
+    obs_vals = ds_diff_masked['obs'].values.ravel()
+    pred_vals = ds_diff_masked['pred'].values.ravel()
+
+    valid = np.isfinite(obs_vals) & np.isfinite(pred_vals)
+    obs_flat = obs_vals[valid]
+    pred_flat = pred_vals[valid]
+
+    print(obs_flat)
+    print(pred_flat)
+
+    # ------------------------------------------------------------------
+    # Figure 4: obs vs pred hexbin
+    # ------------------------------------------------------------------
+    # Clip to plot range
+    vmin, vmax = 0.0, 0.2
+    mask_range = (obs_flat >= vmin) & (obs_flat <= vmax) & (pred_flat >= vmin) & (pred_flat <= vmax)
+    obs_plot = obs_flat[mask_range]
+    pred_plot = pred_flat[mask_range]
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(6.5, 5.5))
+
+    # 2D histogram with log-scaled colour using cubehelix
+    hb = ax.hexbin(
+        obs_plot, pred_plot,
+        gridsize=150,
+        cmap='cubehelix',
+        norm=mcolors.LogNorm(vmin=1, vmax=1e6),
+        mincnt=1,
+        extent=[vmin, vmax, vmin, vmax],
+    )
+
+    # 1:1 reference line
+    ax.plot(
+        [vmin, vmax], [vmin, vmax],
+        linestyle='--', color='grey', linewidth=1, label='1:1 line'
+    )
+
+    # Colour bar
+    cb = fig.colorbar(hb, ax=ax, pad=0.02)
+    cb.set_label('Count (log scale)', fontsize=14)
+    cb.ax.tick_params(labelsize=10)
+
+    # Axis labels – using "change" consistently
+    ax.set_xlabel('Observed change', fontsize=14)
+    ax.set_ylabel('Modelled change', fontsize=14)
+    ax.set_xlim(vmin, vmax)
+    ax.set_ylim(vmin, vmax)
+    ax.set_aspect('equal')
+    ax.tick_params(axis='both', labelsize=10)
+    ax.legend(loc='upper left', fontsize=12)
+
+    plt.tight_layout()
+    plt.savefig(str(OUT / 'fig4_obs_vs_pred_change_hexbin.png'), dpi=config.DPI_PLOT, bbox_inches='tight')
+    plt.show()
+
+    # ------------------------------------------------------------------
+    # Figure 5: obs vs pred hist
+    # ------------------------------------------------------------------
+    bin_edges = np.array([-1.0, -0.05, 0.0, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0])
+    bin_labels = [
+        '-1 to -0.05',
+        '-0.05 to 0',
+        '0 to 0.005',
+        '0.005 to 0.02',
+        '0.02 to 0.05',
+        '0.05 to 0.1',
+        '0.1 to 0.2',
+        '0.2 to 0.5',
+        '0.5 to 1',
+    ]
+
+    obs_counts, _ = np.histogram(obs_flat, bins=bin_edges)
+    pred_counts, _ = np.histogram(pred_flat, bins=bin_edges)
+
+    x = np.arange(len(bin_labels))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(8.55, 4.36))
+
+    ax.bar(x - width / 2, obs_counts, width, color='#58c785', label='Observed')
+    ax.bar(x + width / 2, pred_counts, width, color='#5fa0d3', label='Predicted')
+
+    ax.set_yscale('log')
+    ax.set_title('', fontweight='bold')
+    ax.set_xlabel('HM Change (2020 - 2000)', fontweight='bold', fontsize=13)
+    ax.set_ylabel('Count (log scale)', fontweight='bold', fontsize=13)
+    ax.set_xticks(x)
+    ax.set_xticklabels(bin_labels, rotation=45, ha='right', fontsize=12)
+    ax.tick_params(axis='y', labelsize=11)
+    ax.grid(axis='y', alpha=0.3)
+    ax.legend(loc='upper right', fontsize=12)
+
+    plt.tight_layout()
+    plt.savefig(str(OUT / 'fig5_obs_vs_pred_hist.png'), dpi=config.DPI_PLOT, bbox_inches='tight')
+    plt.show()
+
+
+def figSX():
+    OUT.mkdir(parents=True, exist_ok=True)
+    utils.register_coolwarm_cmap()
+    # ------------------------------------------------------------------
+    # Data
+    # ------------------------------------------------------------------
+    # load HM data
+    ds_obs2000 = rxr.open_rasterio(config.PATHS['hm_2000_aa'], chunks='auto')
+    ds_obs2005 = rxr.open_rasterio(config.PATHS['hm_2005_aa'], chunks='auto')
+    ds_obs2010 = rxr.open_rasterio(config.PATHS['hm_2010_aa'], chunks='auto')
+    ds_obs2015 = rxr.open_rasterio(config.PATHS['hm_2015_aa'], chunks='auto')
+    ds_obs2020 = rxr.open_rasterio(config.PATHS['hm_2020_aa'], chunks='auto')
+
+    ds_pred2005 = rxr.open_rasterio(config.PATHS['pred_2005_central'], chunks='auto')
+    ds_pred2010 = rxr.open_rasterio(config.PATHS['pred_2010_central'], chunks='auto')
+    ds_pred2015 = rxr.open_rasterio(config.PATHS['pred_2015_central'], chunks='auto')
+    ds_pred2020 = rxr.open_rasterio(config.PATHS['pred_2020_central'], chunks='auto')
+
+    ds_obs = xr.concat([ds_obs2005, ds_obs2010, ds_obs2015, ds_obs2020], dim='time')
+    ds_pred = xr.concat([ds_pred2005, ds_pred2010, ds_pred2015, ds_pred2020], dim='time')
+
+    ds_obsdiff = ds_obs - ds_obs2000
+    ds_preddiff = ds_pred - ds_obs2000
+
+    ds_diff = xr.Dataset({
+        'obs': ds_obsdiff,
+        'pred': ds_preddiff
+    })
+    ds_diff = ds_diff.assign_coords(time=pd.to_datetime([2005, 2010, 2015, 2020], format='%Y'))
+    print(ds_diff)
+
+    # ------------------------------------------------------------------
+    # Custom colormap + norm
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Figure SX: obs vs pred random (10 random sites)
+    # ------------------------------------------------------------------
+    #put code here
+
+    # Set random seed for reproducibility
+    rng = np.random.default_rng(7)
+
+    # Squeeze band dimension
+    hm2000 = ds_obs2000.squeeze('band')
+    patch_size = 128
+    n_plots = config.FIGSX_N_PLOTS
+    sites_per_plot = 2
+
+    # ---------- find good candidate blocks ----------
+    hm_valid_frac = hm2000.notnull().coarsen(
+        y=patch_size, x=patch_size, boundary='trim'
+    ).mean().compute()
+
+    hm_mean = hm2000.coarsen(
+        y=patch_size, x=patch_size, boundary='trim'
+    ).mean().compute()
+
+    pred_valid_frac = ds_diff['pred'].isel(time=3).squeeze('band').notnull().coarsen(
+        y=patch_size, x=patch_size, boundary='trim'
+    ).mean().compute()
+
+    obs_abs_change = np.abs(ds_diff['obs'].isel(time=3).squeeze('band')).coarsen(
+        y=patch_size, x=patch_size, boundary='trim'
+    ).mean().compute()
+
+    candidate_mask = (
+        (hm_valid_frac > 0.95).values &
+        (hm_mean > 0.05).values &
+        (hm_mean < 0.95).values &
+        (pred_valid_frac > 0.95).values &
+        (obs_abs_change > 0.02).values
+    )
+
+    candidate_ys, candidate_xs = np.where(candidate_mask)
+    print(f"Found {len(candidate_ys)} candidate blocks")
+
+    total_sites_needed = n_plots * sites_per_plot
+    replace = len(candidate_ys) < total_sites_needed
+    selected = rng.choice(len(candidate_ys), size=total_sites_needed, replace=replace)
+    selected = selected.reshape(n_plots, sites_per_plot)
+
+    years = [2005, 2010, 2015, 2020]
+
+    # Format lat/lon with N/S E/W
+    for plot_idx, chosen in enumerate(selected, start=1):
+        sites_info = []
+
+        for idx in chosen:
+            y0 = int(candidate_ys[idx]) * patch_size
+            x0 = int(candidate_xs[idx]) * patch_size
+            ysl = slice(y0, y0 + patch_size)
+            xsl = slice(x0, x0 + patch_size)
+
+            hm_patch = hm2000.isel(y=ysl, x=xsl).compute().values
+
+            obs_patches, pred_patches = [], []
+            for t in range(4):
+                obs_p = ds_diff['obs'].isel(time=t).squeeze('band').isel(y=ysl, x=xsl).compute().values
+                pred_p = ds_diff['pred'].isel(time=t).squeeze('band').isel(y=ysl, x=xsl).compute().values
+                obs_patches.append(np.nan_to_num(obs_p, nan=0.0))
+                pred_patches.append(np.nan_to_num(pred_p, nan=0.0))
+
+            lons = hm2000.x.values[x0:x0 + patch_size]
+            lats = hm2000.y.values[y0:y0 + patch_size]
+
+            sites_info.append({
+                'hm2000': hm_patch,
+                'obs_diff': obs_patches,
+                'pred_diff': pred_patches,
+                'lon_c': float(np.mean(lons)),
+                'lat_c': float(np.mean(lats)),
+                'extent': [float(lons.min()), float(lons.max()),
+                           float(lats.min()), float(lats.max())],
+            })
+
+        # Fetch satellite images as plain arrays (no cartopy projection needed)
+        print(f"Fetching satellite imagery for plot {plot_idx}...")
+        basemap_imgs = [fetch_esri_satellite(s['extent'], size=512) for s in sites_info]
+        print("Done.")
+
+        for i, s in enumerate(sites_info):
+            lat_s, lon_s = fmt_coord(s['lat_c'], s['lon_c'])
+            print(f"Plot {plot_idx} Site {i+1}: {lat_s}, {lon_s}")
+
+        # ---------- build the 5x4 figure ----------
+        fig = plt.figure(figsize=(16, 20))
+
+        # Use width_ratios to insert a gap between columns 2 and 3
+        # Columns: site1_obs, site1_pred, gap, site2_obs, site2_pred
+        gs = fig.add_gridspec(5, 5, hspace=0.12, wspace=0.08,
+                              width_ratios=[1, 1, 0.15, 1, 1])
+
+        cmap_hm = 'viridis'
+        cmap_diff = plt.get_cmap('my_custom_coolwarm').copy()
+        cmap_diff.set_bad(color='#E4E4E4')
+        vmin_d, vmax_d = -0.2, 0.2
+
+        im_hm = im_diff = None
+        row0_hm_axes = []
+        bm_axes = []
+
+        # Map site columns: site 0 -> cols 0,1; site 1 -> cols 3,4 (skip col 2 = gap)
+        for s, (site, c0, bm_img) in enumerate(zip(sites_info, [0, 3], basemap_imgs)):
+            # Row 0, col c0: observed HM 2000
+            ax = fig.add_subplot(gs[0, c0])
+            im_hm = ax.imshow(site['hm2000'], cmap=cmap_hm, vmin=0, vmax=1,
+                               aspect='auto', interpolation='nearest')
+            ax.set_title('Observed HM 2000', fontsize=14, pad=6)
+            ax.set_xticks([]); ax.set_yticks([])
+            row0_hm_axes.append(ax)
+
+            # Row 0, col c0+1: satellite basemap
+            ax_bm = fig.add_subplot(gs[0, c0 + 1])
+            ax_bm.imshow(bm_img, aspect='auto', interpolation='bilinear')
+            ax_bm.set_title('Location', fontsize=14, pad=6)
+            ax_bm.set_xticks([]); ax_bm.set_yticks([])
+            bm_axes.append(ax_bm)
+
+            # Rows 1-4: observed and predicted HM change
+            for r, year in enumerate(years):
+                ax_o = fig.add_subplot(gs[r + 1, c0])
+                im_diff = ax_o.imshow(site['obs_diff'][r], cmap=cmap_diff,
+                                      vmin=vmin_d, vmax=vmax_d,
+                                      aspect='auto', interpolation='nearest')
+                ax_o.set_xticks([]); ax_o.set_yticks([])
+
+                ax_p = fig.add_subplot(gs[r + 1, c0 + 1])
+                ax_p.imshow(site['pred_diff'][r], cmap=cmap_diff,
+                            vmin=vmin_d, vmax=vmax_d,
+                            aspect='auto', interpolation='nearest')
+                ax_p.set_xticks([]); ax_p.set_yticks([])
+
+                # Column headers on the first change row only
+                if r == 0:
+                    ax_o.set_title('Observed change', fontsize=14, pad=6)
+                    ax_p.set_title('Predicted change', fontsize=14, pad=6)
+
+                # Row year labels on the leftmost column only
+                if c0 == 0:
+                    ax_o.set_ylabel(str(year), fontsize=16, rotation=0, labelpad=30,
+                                    va='center', ha='right')
+
+        # ---------- layout adjustments ----------
+        fig.subplots_adjust(bottom=0.06, top=0.94)
+        fig.canvas.draw()
+
+        # ---------- site labels spanning two columns ----------
+        for s, site in enumerate(sites_info):
+            lat_s, lon_s = fmt_coord(site['lat_c'], site['lon_c'])
+            pos_l = row0_hm_axes[s].get_position()
+            pos_r = bm_axes[s].get_position()
+            x_center = (pos_l.x0 + pos_r.x1) / 2
+            y_top = max(pos_l.y1, pos_r.y1) + 0.015
+            fig.text(x_center, y_top,
+                     f'Site {s+1}: {lat_s}, {lon_s}',
+                     ha='center', va='bottom', fontsize=18, fontweight='bold')
+
+        # ---------- colorbars ----------
+        cb1_ax = fig.add_axes([0.08, 0.025, 0.35, 0.012])
+        cb1 = fig.colorbar(im_hm, cax=cb1_ax, orientation='horizontal')
+        cb1.set_label('HM 2000', fontsize=16)
+        cb1.ax.tick_params(labelsize=14)
+
+        cb2_ax = fig.add_axes([0.55, 0.025, 0.35, 0.012])
+        cb2 = fig.colorbar(im_diff, cax=cb2_ax, orientation='horizontal')
+        cb2.set_label('HM change from 2000', fontsize=16)
+        cb2.ax.tick_params(labelsize=14)
+
+        # ---------- globe insets ----------
+        for site, ax_bm in zip(sites_info, bm_axes):
+            pos = ax_bm.get_position()
+            ins = 0.06
+            ax_g = fig.add_axes(
+                [pos.x1 - ins - 0.005, pos.y1 - ins - 0.005, ins, ins],
+                projection=ccrs.Orthographic(
+                    central_longitude=site['lon_c'],
+                    central_latitude=site['lat_c']
+                )
+            )
+            ax_g.set_global()
+            ax_g.stock_img()
+            ax_g.coastlines(linewidth=0.3)
+            ax_g.plot(site['lon_c'], site['lat_c'], 'ro',
+                      markersize=4, transform=ccrs.PlateCarree(), zorder=10)
+
+        output_path = str(OUT / f'fig_SX_obs_vs_predicted_random_{plot_idx:02d}.png')
+        fig.savefig(output_path, dpi=config.DPI_MAP, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Saved {output_path}")
+
+
+def fig6():
+    OUT.mkdir(parents=True, exist_ok=True)
+    utils.register_coolwarm_cmap()
+    # ------------------------------------------------------------------
+    # Data
+    # ------------------------------------------------------------------
+    # load HM data
+    ds_obs2000 = rxr.open_rasterio(config.PATHS['hm_2000_aa'], chunks='auto')
+    ds_obs2005 = rxr.open_rasterio(config.PATHS['hm_2005_aa'], chunks='auto')
+    ds_obs2010 = rxr.open_rasterio(config.PATHS['hm_2010_aa'], chunks='auto')
+    ds_obs2015 = rxr.open_rasterio(config.PATHS['hm_2015_aa'], chunks='auto')
+    ds_obs2020 = rxr.open_rasterio(config.PATHS['hm_2020_aa'], chunks='auto')
+
+    ds_pred2005 = rxr.open_rasterio(config.PATHS['pred_2005_central'], chunks='auto')
+    ds_pred2010 = rxr.open_rasterio(config.PATHS['pred_2010_central'], chunks='auto')
+    ds_pred2015 = rxr.open_rasterio(config.PATHS['pred_2015_central'], chunks='auto')
+    ds_pred2020 = rxr.open_rasterio(config.PATHS['pred_2020_central'], chunks='auto')
+
+    ds_obs = xr.concat([ds_obs2005, ds_obs2010, ds_obs2015, ds_obs2020], dim='time')
+    ds_pred = xr.concat([ds_pred2005, ds_pred2010, ds_pred2015, ds_pred2020], dim='time')
+
+    ds_obsdiff = ds_obs - ds_obs2000
+    ds_preddiff = ds_pred - ds_obs2000
+
+    ds_diff = xr.Dataset({
+        'obs': ds_obsdiff,
+        'pred': ds_preddiff
+    })
+    ds_diff = ds_diff.assign_coords(time=pd.to_datetime([2005, 2010, 2015, 2020], format='%Y'))
+    print(ds_diff)
+
+    # ------------------------------------------------------------------
+    # Custom colormap + norm
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Figure 6: obs vs predicted predetermined sites
+    # ------------------------------------------------------------------
+    #put code here
+
+    # Squeeze band dimension
+    hm2000 = ds_obs2000.squeeze('band')
+    patch_size = 128
+
+    # ---------- predetermined site centres ----------
+    -11.5920,20.0837
+    site_coords = [
+        (-10.1163,32.1712),    # Site 1: zambia
+        (-26.02, -61.92),  # Site 2: granchaco argentina
+
+    ]
+
+    years = [2005, 2010, 2015, 2020]
+    sites_info = []
+
+    for lat_c, lon_c in site_coords:
+        # Find the nearest pixel indices for the centre coordinate
+        y_idx = int(np.abs(hm2000.y.values - lat_c).argmin())
+        x_idx = int(np.abs(hm2000.x.values - lon_c).argmin())
+
+        # Centre the 128x128 patch on that pixel
+        y0 = max(0, y_idx - patch_size // 2)
+        x0 = max(0, x_idx - patch_size // 2)
+        # Clamp to array bounds
+        y0 = min(y0, len(hm2000.y) - patch_size)
+        x0 = min(x0, len(hm2000.x) - patch_size)
+
+        ysl = slice(y0, y0 + patch_size)
+        xsl = slice(x0, x0 + patch_size)
+
+        hm_patch = hm2000.isel(y=ysl, x=xsl).compute().values
+
+        obs_patches, pred_patches = [], []
+        for t in range(4):
+            obs_p = ds_diff['obs'].isel(time=t).squeeze('band').isel(y=ysl, x=xsl).compute().values
+            pred_p = ds_diff['pred'].isel(time=t).squeeze('band').isel(y=ysl, x=xsl).compute().values
+            obs_patches.append(np.nan_to_num(obs_p, nan=0.0))
+            pred_patches.append(np.nan_to_num(pred_p, nan=0.0))
+
+        lons = hm2000.x.values[x0:x0 + patch_size]
+        lats = hm2000.y.values[y0:y0 + patch_size]
+
+        sites_info.append({
+            'hm2000': hm_patch,
+            'obs_diff': obs_patches,
+            'pred_diff': pred_patches,
+            'lon_c': float(np.mean(lons)),
+            'lat_c': float(np.mean(lats)),
+            'extent': [float(lons.min()), float(lons.max()),
+                       float(lats.min()), float(lats.max())],
+        })
+
+    # Fetch satellite images as plain arrays
+    print("Fetching satellite imagery...")
+    basemap_imgs = [fetch_esri_satellite(s['extent'], size=512) for s in sites_info]
+    print("Done.")
+
+    # Format lat/lon with N/S E/W
+    for i, s in enumerate(sites_info):
+        lat_s, lon_s = fmt_coord(s['lat_c'], s['lon_c'])
+        print(f"Site {i+1}: {lat_s}, {lon_s}")
+
+    # ---------- build the 5x4 figure ----------
+    fig = plt.figure(figsize=(16, 20))
+
+    # Columns: site1_obs, site1_pred, gap, site2_obs, site2_pred
+    gs = fig.add_gridspec(5, 5, hspace=0.12, wspace=0.08,
+                          width_ratios=[1, 1, 0.15, 1, 1])
+
+    cmap_hm = 'viridis'
+    cmap_diff = plt.get_cmap('my_custom_coolwarm').copy()
+    cmap_diff.set_bad(color='#E4E4E4')
+    vmin_d, vmax_d = -0.2, 0.2
+
+    im_hm = im_diff = None
+    row0_hm_axes = []
+    bm_axes = []
+
+    # site 0 -> cols 0,1; site 1 -> cols 3,4 (col 2 = gap)
+    for s, (site, c0, bm_img) in enumerate(zip(sites_info, [0, 3], basemap_imgs)):
+        # Row 0, col c0: observed HM 2000
+        ax = fig.add_subplot(gs[0, c0])
+        im_hm = ax.imshow(site['hm2000'], cmap=cmap_hm, vmin=0, vmax=1,
+                           aspect='auto', interpolation='nearest')
+        ax.set_title('Observed HM 2000', fontsize=14, pad=6)
+        ax.set_xticks([]); ax.set_yticks([])
+        row0_hm_axes.append(ax)
+
+        # Row 0, col c0+1: satellite basemap
+        ax_bm = fig.add_subplot(gs[0, c0 + 1])
+        ax_bm.imshow(bm_img, aspect='auto', interpolation='bilinear')
+        ax_bm.set_title('Location', fontsize=14, pad=6)
+        ax_bm.set_xticks([]); ax_bm.set_yticks([])
+        bm_axes.append(ax_bm)
+
+        # Rows 1-4: observed and predicted HM change
+        for r, year in enumerate(years):
+            ax_o = fig.add_subplot(gs[r + 1, c0])
+            im_diff = ax_o.imshow(site['obs_diff'][r], cmap=cmap_diff,
+                                  vmin=vmin_d, vmax=vmax_d,
+                                  aspect='auto', interpolation='nearest')
+            ax_o.set_xticks([]); ax_o.set_yticks([])
+
+            ax_p = fig.add_subplot(gs[r + 1, c0 + 1])
+            ax_p.imshow(site['pred_diff'][r], cmap=cmap_diff,
+                        vmin=vmin_d, vmax=vmax_d,
+                        aspect='auto', interpolation='nearest')
+            ax_p.set_xticks([]); ax_p.set_yticks([])
+
+            # Column headers on the first change row only
+            if r == 0:
+                ax_o.set_title('Observed change', fontsize=14, pad=6)
+                ax_p.set_title('Predicted change', fontsize=14, pad=6)
+
+            # Row year labels on the leftmost column only
+            if c0 == 0:
+                ax_o.set_ylabel(str(year), fontsize=16, rotation=0, labelpad=30,
+                                va='center', ha='right')
+
+    # ---------- layout adjustments ----------
+    fig.subplots_adjust(bottom=0.06, top=0.94)
+    fig.canvas.draw()
+
+    # ---------- site labels spanning two columns ----------
+    for s, site in enumerate(sites_info):
+        lat_s, lon_s = fmt_coord(site['lat_c'], site['lon_c'])
+        pos_l = row0_hm_axes[s].get_position()
+        pos_r = bm_axes[s].get_position()
+        x_center = (pos_l.x0 + pos_r.x1) / 2
+        y_top = max(pos_l.y1, pos_r.y1) + 0.015
+        fig.text(x_center, y_top,
+                 f'Site {s+1}: {lat_s}, {lon_s}',
+                 ha='center', va='bottom', fontsize=18, fontweight='bold')
+
+    # ---------- colorbars ----------
+    cb1_ax = fig.add_axes([0.08, 0.025, 0.35, 0.012])
+    cb1 = fig.colorbar(im_hm, cax=cb1_ax, orientation='horizontal')
+    cb1.set_label('HM 2000', fontsize=16)
+    cb1.ax.tick_params(labelsize=14)
+
+    cb2_ax = fig.add_axes([0.55, 0.025, 0.35, 0.012])
+    cb2 = fig.colorbar(im_diff, cax=cb2_ax, orientation='horizontal')
+    cb2.set_label('HM change from 2000', fontsize=16)
+    cb2.ax.tick_params(labelsize=14)
+
+    # ---------- globe insets ----------
+    for site, ax_bm in zip(sites_info, bm_axes):
+        pos = ax_bm.get_position()
+        ins = 0.06
+        ax_g = fig.add_axes(
+            [pos.x1 - ins - 0.005, pos.y1 - ins - 0.005, ins, ins],
+            projection=ccrs.Orthographic(
+                central_longitude=site['lon_c'],
+                central_latitude=site['lat_c']
+            )
+        )
+        ax_g.set_global()
+        ax_g.stock_img()
+        ax_g.coastlines(linewidth=0.3)
+        ax_g.plot(site['lon_c'], site['lat_c'], 'ro',
+                  markersize=4, transform=ccrs.PlateCarree(), zorder=10)
+
+    fig.savefig(str(OUT / 'fig_6_obs_vs_predicted_predetermined'), dpi=config.DPI_MAP, bbox_inches='tight')
+    plt.show()
+
+
+def fig7():
+    OUT.mkdir(parents=True, exist_ok=True)
+    # ------------------------------------------------------------------
+    # Data prep
+    # ------------------------------------------------------------------
+    # load HM data
+    ds_obs1990 = rxr.open_rasterio(config.PATHS['hm_1990_aa'], chunks='auto')
+    ds_obs1995 = rxr.open_rasterio(config.PATHS['hm_1995_aa'], chunks='auto')
+    ds_obs2000 = rxr.open_rasterio(config.PATHS['hm_2000_aa'], chunks='auto')
+    ds_obs2005 = rxr.open_rasterio(config.PATHS['hm_2005_aa'], chunks='auto')
+    ds_obs2010 = rxr.open_rasterio(config.PATHS['hm_2010_aa'], chunks='auto')
+    ds_obs2015 = rxr.open_rasterio(config.PATHS['hm_2015_aa'], chunks='auto')
+    ds_obs2020 = rxr.open_rasterio(config.PATHS['hm_2020_aa'], chunks='auto')
+
+    ds_pred2005_central = rxr.open_rasterio(config.PATHS['pred_2005_central'], chunks='auto')
+    ds_pred2005_upper = rxr.open_rasterio(config.PATHS['pred_2005_upper'], chunks='auto')
+    ds_pred2005_lower = rxr.open_rasterio(config.PATHS['pred_2005_lower'], chunks='auto')
+    ds_pred2010_central = rxr.open_rasterio(config.PATHS['pred_2010_central'], chunks='auto')
+    ds_pred2010_upper = rxr.open_rasterio(config.PATHS['pred_2010_upper'], chunks='auto')
+    ds_pred2010_lower = rxr.open_rasterio(config.PATHS['pred_2010_lower'], chunks='auto')
+    ds_pred2015_central = rxr.open_rasterio(config.PATHS['pred_2015_central'], chunks='auto')
+    ds_pred2015_upper = rxr.open_rasterio(config.PATHS['pred_2015_upper'], chunks='auto')
+    ds_pred2015_lower = rxr.open_rasterio(config.PATHS['pred_2015_lower'], chunks='auto')
+    ds_pred2020_central = rxr.open_rasterio(config.PATHS['pred_2020_central'], chunks='auto')
+    ds_pred2020_upper = rxr.open_rasterio(config.PATHS['pred_2020_upper'], chunks='auto')
+    ds_pred2020_lower = rxr.open_rasterio(config.PATHS['pred_2020_lower'], chunks='auto')
+
+    full_time = pd.to_datetime([1990, 1995, 2000, 2005, 2010, 2015, 2020], format='%Y')
+    pred_time = pd.to_datetime([2005, 2010, 2015, 2020], format='%Y')
+
+    ds_obs = xr.concat(
+        [ds_obs1990, ds_obs1995, ds_obs2000, ds_obs2005, ds_obs2010, ds_obs2015, ds_obs2020],
+        dim=pd.Index(full_time, name='time')
+    )
+
+    ds_pred_central = xr.concat(
+        [ds_pred2005_central, ds_pred2010_central, ds_pred2015_central, ds_pred2020_central],
+        dim=pd.Index(pred_time, name='time')
+    ).reindex(time=full_time)
+
+    ds_pred_upper = xr.concat(
+        [ds_pred2005_upper, ds_pred2010_upper, ds_pred2015_upper, ds_pred2020_upper],
+        dim=pd.Index(pred_time, name='time')
+    ).reindex(time=full_time)
+
+    ds_pred_lower = xr.concat(
+        [ds_pred2005_lower, ds_pred2010_lower, ds_pred2015_lower, ds_pred2020_lower],
+        dim=pd.Index(pred_time, name='time')
+    ).reindex(time=full_time)
+
+    ds_combined = xr.Dataset({
+        'observed': ds_obs,
+        'central': ds_pred_central,
+        'upper': ds_pred_upper,
+        'lower': ds_pred_lower
+    })
+    print(ds_combined)
+
+    # ------------------------------------------------------------------
+    # Figure 7: timeseries
+    # ------------------------------------------------------------------
+
+    # ---------- setup ----------
+    patch_size = 128
+    hm2000 = ds_obs2000.squeeze('band')
+
+    site_coords = [
+        (-10.1163,32.1712),    # Site 1: zambia
+        (-26.02, -61.92),  # Site 2: chaco
+    ]
+    # ---------- build patches ----------
+    site_patches = []
+    for lat_c, lon_c in site_coords:
+        y_idx = int(np.abs(hm2000.y.values - lat_c).argmin())
+        x_idx = int(np.abs(hm2000.x.values - lon_c).argmin())
+        y0 = max(0, y_idx - patch_size // 2)
+        x0 = max(0, x_idx - patch_size // 2)
+        y0 = min(y0, len(hm2000.y) - patch_size)
+        x0 = min(x0, len(hm2000.x) - patch_size)
+
+        lons = hm2000.x.values[x0:x0 + patch_size]
+        lats = hm2000.y.values[y0:y0 + patch_size]
+
+        site_patches.append({
+            'y0': y0, 'x0': x0,
+            'lons': lons, 'lats': lats,
+            'lat_c': float(np.mean(lats)),
+            'lon_c': float(np.mean(lons)),
+            'extent': [float(lons.min()), float(lons.max()),
+                       float(lats.min()), float(lats.max())],
+        })
+
+    # Fetch satellite basemaps once
+    print("Fetching satellite imagery...")
+    basemap_imgs = [fetch_esri_satellite(s['extent'], size=512) for s in site_patches]
+    print("Done.")
+
+    time_vals = ds_combined.time.values
+    years = [pd.Timestamp(t).year for t in time_vals]
+
+    # ---------- iterate seed 0-20 for site 2 ----------
+    for seed in config.FIG7_SEEDS:
+        rng_site1 = np.random.default_rng(1000 + seed)
+        site_patches[0]['pixels'] = [(int(rng_site1.integers(0, patch_size)), int(rng_site1.integers(0, patch_size)))
+                                      for _ in range(2)]
+
+        pixel_data_site1 = []
+        for py, px in site_patches[0]['pixels']:
+            abs_y = site_patches[0]['y0'] + py
+            abs_x = site_patches[0]['x0'] + px
+            obs_ts = ds_combined['observed'].isel(band=0, y=abs_y, x=abs_x).compute().values
+            cen_ts = ds_combined['central'].isel(band=0, y=abs_y, x=abs_x).compute().values
+            upp_ts = ds_combined['upper'].isel(band=0, y=abs_y, x=abs_x).compute().values
+            low_ts = ds_combined['lower'].isel(band=0, y=abs_y, x=abs_x).compute().values
+            pixel_lat = float(hm2000.y.values[abs_y])
+            pixel_lon = float(hm2000.x.values[abs_x])
+            pixel_data_site1.append({
+                'site_idx': 0, 'py': py, 'px': px,
+                'lat': pixel_lat, 'lon': pixel_lon,
+                'observed': obs_ts, 'central': cen_ts, 'upper': upp_ts, 'lower': low_ts,
+            })
+
+        rng_site2 = np.random.default_rng(seed)
+        site_patches[1]['pixels'] = [(int(rng_site2.integers(0, patch_size)), int(rng_site2.integers(0, patch_size)))
+                                      for _ in range(2)]
+
+        pixel_data_site2 = []
+        for py, px in site_patches[1]['pixels']:
+            abs_y = site_patches[1]['y0'] + py
+            abs_x = site_patches[1]['x0'] + px
+            obs_ts = ds_combined['observed'].isel(band=0, y=abs_y, x=abs_x).compute().values
+            cen_ts = ds_combined['central'].isel(band=0, y=abs_y, x=abs_x).compute().values
+            upp_ts = ds_combined['upper'].isel(band=0, y=abs_y, x=abs_x).compute().values
+            low_ts = ds_combined['lower'].isel(band=0, y=abs_y, x=abs_x).compute().values
+            pixel_lat = float(hm2000.y.values[abs_y])
+            pixel_lon = float(hm2000.x.values[abs_x])
+            pixel_data_site2.append({
+                'site_idx': 1, 'py': py, 'px': px,
+                'lat': pixel_lat, 'lon': pixel_lon,
+                'observed': obs_ts, 'central': cen_ts, 'upper': upp_ts, 'lower': low_ts,
+            })
+
+        pixel_data = pixel_data_site1 + pixel_data_site2
+        print(f"\n--- Seed {seed} ---")
+
+        # ---------- build figure ----------
+        fig = plt.figure(figsize=(20, 9))
+        gs = fig.add_gridspec(2, 5, hspace=0.30, wspace=0.10,
+                              width_ratios=[1, 1, 0.15, 1, 1],
+                              height_ratios=[1, 1.3])
+
+        col_map = [0, 1, 3, 4]
+
+        for i, (pxd, col) in enumerate(zip(pixel_data, col_map)):
+            s_idx = pxd['site_idx']
+            bm_img = basemap_imgs[s_idx]
+            site = site_patches[s_idx]
+
+            # ---- Row 0: location map ----
+            ax_loc = fig.add_subplot(gs[0, col])
+            ax_loc.imshow(bm_img, aspect='auto', interpolation='bilinear')
+
+            scale = 512 / patch_size
+            dot_x = pxd['px'] * scale
+            dot_y = pxd['py'] * scale
+            ax_loc.plot(dot_x, dot_y, 'ro', markersize=10,
+                        markeredgecolor='white', markeredgewidth=1.5, zorder=10)
+            ax_loc.set_xticks([]); ax_loc.set_yticks([])
+            lat_s, lon_s = fmt_coord(pxd['lat'], pxd['lon'])
+            ax_loc.set_title(f'{lat_s}, {lon_s}', fontsize=16, pad=6)
+
+            # Globe inset
+            pos = ax_loc.get_position()
+            ins = 0.11
+            ax_g = fig.add_axes(
+                [pos.x1 - ins - 0.003, pos.y1 - ins - 0.003, ins, ins],
+                projection=ccrs.Orthographic(
+                    central_longitude=site['lon_c'],
+                    central_latitude=site['lat_c']
+                )
+            )
+            ax_g.set_global()
+            ax_g.stock_img()
+            ax_g.coastlines(linewidth=0.3)
+            ax_g.plot(pxd['lon'], pxd['lat'], 'ro',
+                      markersize=4, transform=ccrs.PlateCarree(), zorder=10)
+
+            # ---- Row 1: time series ----
+            ax_ts = fig.add_subplot(gs[1, col])
+
+            valid = ~np.isnan(pxd['central'])
+            yrs_valid = np.array(years)[valid]
+            ax_ts.fill_between(yrs_valid, pxd['lower'][valid], pxd['upper'][valid],
+                                alpha=0.3, color='cornflowerblue', label='95% PI')
+            ax_ts.plot(yrs_valid, pxd['central'][valid], 'r--',
+                       linewidth=1.8, label='Predicted')
+
+            obs_valid = ~np.isnan(pxd['observed'])
+            ax_ts.plot(np.array(years)[obs_valid], pxd['observed'][obs_valid],
+                       'k-', linewidth=1.8, label='Observed')
+
+            ax_ts.set_xlabel('Year', fontsize=16)
+            if col in (0, 3):
+                ax_ts.set_ylabel('HM', fontsize=16)
+            else:
+                ax_ts.set_yticks([])
+            ax_ts.tick_params(labelsize=14)
+            ax_ts.set_xlim(1988, 2022)
+            ax_ts.set_ylim(0, 1)
+            ax_ts.set_xticks([1990, 1995, 2000, 2005, 2010, 2015, 2020])
+            ax_ts.set_xticklabels(['1990', '', '2000', '', '2010', '', '2020'], fontsize=14)
+
+            if i == 0:
+                ax_ts.legend(fontsize=14, loc='upper left', framealpha=0.9)
+
+        fig.savefig(str(OUT / f'fig_7_timeseries_site2seed{seed:02d}.png'), dpi=config.DPI_MAP, bbox_inches='tight')
+        plt.close(fig)
+        print("  Saved " + str(OUT / f"fig_7_timeseries_site2seed{seed:02d}.png"))
+
+    print(f"\nAll {len(config.FIG7_SEEDS)} iterations complete.")
