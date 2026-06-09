@@ -285,3 +285,50 @@ def fig2_3():
         )
 
     fig.savefig(OUT / 'fig3_uncer_map_hr.png', dpi=config.DPI_MAP, bbox_inches='tight')
+
+
+def figS1_S4():
+    """Fig S1 (observed 2020-2000 diff) + Figs S2/S3/S4 (2025/2030/2035 - 2020).
+
+    S2-S4 were three byte-identical notebook blocks differing only by prediction
+    year, colorbar label, and output name; reproduced here as one loop driven by
+    config.FIGS_YEAR_VARIANTS.
+    """
+    OUT.mkdir(parents=True, exist_ok=True)
+    utils.register_coolwarm_cmap()
+
+    # ---- Figure S1: observed HM change 2020-2000 ----
+    dsobs = rxr.open_rasterio(config.PATHS['hm_diff_obs'], chunks='auto')
+    dsobs = dsobs.to_dataset(name="hm")
+    ds = dsobs.drop('band')
+    ds = ds.squeeze()
+    mask = ((ds['hm'] >= -1) & (ds['hm'] <= 1)).compute()
+    ds = ds.where(mask, drop=True)
+    ds['hm'] = ds['hm'].chunk({'x': 1024, 'y': 1024})
+    pds = ds['hm'].compute()
+
+    fig, ax = utils.build_global_robinson_map(
+        pds, cmap='my_custom_coolwarm', clim=config.CLIM,
+        cbar_label='HM change 2020-2000', hide_geo_spine=True)
+    utils.add_circular_insets(fig, ax, pds, cmap='my_custom_coolwarm',
+                              vmin=config.CLIM[0], vmax=config.CLIM[1])
+    fig.savefig(OUT / 'figS1_hmdiff_map.png', dpi=config.DPI_MAP, bbox_inches='tight')
+
+    # ---- Figures S2/S3/S4: predicted HM change YEAR-2020 ----
+    ds2020 = rxr.open_rasterio(config.PATHS['hm_2020_aa'], chunks='auto')
+    for pred_key, label, fname in config.FIGS_YEAR_VARIANTS:
+        pred = rxr.open_rasterio(config.PATHS[pred_key], chunks='auto')
+        ds = pred - ds2020
+        ds = ds.to_dataset(name="hm")
+        ds = ds.drop('band')
+        ds = ds.squeeze()
+        mask = ((ds['hm'] >= -1) & (ds['hm'] <= 1)).compute()
+        ds = ds.where(mask, drop=True)
+        ds['hm'] = ds['hm'].chunk({'x': 1024, 'y': 1024})
+        pds = ds['hm'].compute()
+
+        fig, ax = utils.build_global_robinson_map(
+            pds, cmap='my_custom_coolwarm', clim=config.CLIM, cbar_label=label)
+        utils.add_circular_insets(fig, ax, pds, cmap='my_custom_coolwarm',
+                                  vmin=config.CLIM[0], vmax=config.CLIM[1])
+        fig.savefig(OUT / fname, dpi=config.DPI_MAP, bbox_inches='tight')
