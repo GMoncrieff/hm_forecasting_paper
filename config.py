@@ -117,5 +117,18 @@ FIGS_YEAR_VARIANTS = [
     ("pred_2035_central", "HM change 2035-2020", "figS4_hm2035_map.png"),
 ]
 
-# --- regional zooms (Figs S5/S6); populated in Task 10 from figS5_regional_zooms.py ---
-REGIONS = []
+# --- regional zooms (Figs S5/S6) ---
+REGIONS = {
+    "north_america":     ("North America",                (-168, -52, 14, 72)),
+    "central_america":   ("Central America",              (-93, -59, 7, 22)),
+    "south_america":     ("South America",                (-82, -34, -56, 13)),
+    "europe":            ("Europe",                       (-25, 45, 34, 72)),
+    "mena":              ("Middle East & North Africa",   (-18, 63, 11, 40)),
+    "central_asia":      ("Central Asia",                 (40, 120, 28, 79)),
+    "east_asia":         ("East Asia",                    (100, 146, 18, 54)),
+    "south_asia":        ("South Asia",                   (60, 98, 5, 38)),
+    "southeast_asia":    ("Southeast Asia",               (92, 142, -11, 29)),
+    "subsaharan_africa": ("Sub-Saharan Africa",           (-19, 52, -36, 18)),
+    "australia_nz":      ("Australia & New Zealand",      (110, 179, -48, -10)),
+}
+TARGET_PX_ZOOM = 1200

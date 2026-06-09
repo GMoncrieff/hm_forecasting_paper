@@ -11,6 +11,7 @@ import pandas as pd
 import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import seaborn as sns
 import matplotlib.path as mpath
 from matplotlib.patches import Circle
 from matplotlib.colors import ListedColormap
@@ -19,7 +20,8 @@ import holoviews as hv
 
 import config
 import utils
-from utils import fetch_esri_satellite, fmt_coord
+from utils import (fetch_esri_satellite, fmt_coord,
+                   transform_xarray_layer, create_ternary_alpha_array)
 
 OUT = config.OUTPUT_DIR
 
@@ -1122,3 +1124,802 @@ def fig7():
         print("  Saved " + str(OUT / f"fig_7_timeseries_site2seed{seed:02d}.png"))
 
     print(f"\nAll {len(config.FIG7_SEEDS)} iterations complete.")
+
+
+def fig8_9():
+    OUT.mkdir(parents=True, exist_ok=True)
+    utils.register_coolwarm_cmap()
+    esri = rxr.open_rasterio(config.PATHS['esri_hm'], chunks='auto')
+    cpi = rxr.open_rasterio(config.PATHS['cpi_hm'], chunks='auto')
+    hm = rxr.open_rasterio(config.PATHS['hm_diff'], chunks='auto')
+
+    ds = xr.Dataset({
+        "esri": esri,
+        "hm": hm,
+        "cpi": cpi
+    })
+
+    ds['hm'] = ds['hm'].where(abs(ds['hm']) <= 1)
+    mask = ds.to_array().notnull().all(dim='variable')
+    ds = ds.where(mask)
+    print(ds)
+
+    # ------------------------------------------------------------------
+    # Sample + Spearman correlation
+    # ------------------------------------------------------------------
+
+    dims = ('y', 'x') if {'y','x'}.issubset(ds.dims) else ('lat', 'lon')
+
+    # stack variables and compute a validity mask (any variable non-NaN)
+    stacked = ds.stack(points=dims)
+
+    n = 1000_000
+    N = stacked.dims['points']
+    rng = np.random.default_rng(42)
+    idx = rng.choice(N, size=min(n, N), replace=False)
+    sample = stacked.isel(points=idx)
+    sample = sample.load()
+    simple = sample.drop(['x','y','points'])
+
+    # get variables as rows (long)
+    vals = simple.to_dataframe()  # multi-index (points, variable) -> value
+    vals = vals.reset_index()  # columns -> variables
+
+    #drop cols band and spatial_ref and points
+
+    vals = vals.drop(columns=['band', 'spatial_ref', 'points'])
+    #drop row with any na
+    vals = vals.dropna()
+    vals
+    #calc spearman correlation
+    spearman_matrix = vals.corr(method='spearman')
+
+    print(spearman_matrix)
+
+    # ------------------------------------------------------------------
+    # Figure 8: esri/hm/cpi hexbin pair matrix
+    # ------------------------------------------------------------------
+
+    cols = ['esri', 'hm', 'cpi']
+    plot_data = vals[cols]
+
+    g = sns.PairGrid(plot_data, height=3.6, corner=True)
+
+    hexbin_artists = []
+
+    def hexbin_plot(x, y, color=None, **kwargs):
+        ax = plt.gca()
+        hb = ax.hexbin(x, y, gridsize=40, bins='log', cmap='inferno', mincnt=1, linewidths=0)
+        hexbin_artists.append(hb)
+
+    def hist_plot(x, color=None, **kwargs):
+        ax = plt.gca()
+        sns.histplot(x=x, bins=30, color='gray', ax=ax)
+        ax.yaxis.set_visible(True)
+        ax.spines['left'].set_visible(True)
+        ax.tick_params(axis='both', labelsize=16)
+
+    g.map_diag(hist_plot)
+    g.map_lower(hexbin_plot)
+
+    limits = {
+        'esri': (0, 1),
+        'cpi':  (0, 1),
+        'hm':   (-0.1, 0.3)
+    }
+
+    for i, row_var in enumerate(cols):
+        for j, col_var in enumerate(cols):
+            if j > i:
+                continue
+
+            ax = g.axes[i, j]
+            if ax is None:
+                continue
+
+            ax.set_xlim(limits[col_var])
+
+            if i != j:
+                ax.set_ylim(limits[row_var])
+
+            ax.tick_params(axis='both', labelsize=16)
+
+    for i, var in enumerate(cols):
+        ax = g.axes[i, i]
+        if ax is not None:
+            ax.set_ylabel('Count', fontsize=18)
+            ax.tick_params(axis='both', labelsize=16)
+
+    for i, row_var in enumerate(cols):
+        ax = g.axes[i, 0]
+        if ax is not None:
+            ax.set_ylabel('Count' if i == 0 else row_var, fontsize=18)
+
+    for j, col_var in enumerate(cols):
+        ax = g.axes[len(cols) - 1, j]
+        if ax is not None:
+            ax.set_xlabel(col_var, fontsize=18)
+
+    plot_axes = [ax for row in g.axes for ax in row if ax is not None]
+    if hexbin_artists and plot_axes:
+        cbar = g.fig.colorbar(hexbin_artists[0], ax=plot_axes, fraction=0.04, pad=0.03)
+        cbar.set_label('Pixel count (log scale)', fontsize=18)
+        cbar.ax.tick_params(labelsize=16)
+
+    g.fig.subplots_adjust(top=0.95, right=0.88, wspace=0.22, hspace=0.22)
+    g.fig.suptitle('Variable Comparison Matrix (Lower Triangle)', fontsize=20)
+
+    g.savefig(str(OUT / 'fig8_hexbin_matrix_lower.png'), dpi=config.DPI_PLOT)
+
+    # ------------------------------------------------------------------
+    # Figure 9 data prep: beta-transform layers
+    # ------------------------------------------------------------------
+
+    # Assuming 'ds' is your xarray Dataset containing 'esri', 'hm', 'cpi'
+    # We create a new dataset to hold the transformed variables
+    ds_transformed = ds.copy(deep=True)
+
+    variables_to_transform = ['esri', 'hm', 'cpi']
+
+    for var in variables_to_transform:
+        print(f"Transforming {var}...")
+        ds_transformed[var] = transform_xarray_layer(
+            ds[var], 
+            a_param=0.8, 
+            b_param=3
+        )
+
+    # Now ds_transformed contains the beta-distributed data 
+    # with all original coordinates (lat, lon) preserved.
+
+    ds = ds_transformed
+    ds = ds.drop('band')
+    rgb = create_ternary_alpha_array(ds, "esri", "hm", "cpi")
+
+    # ------------------------------------------------------------------
+    # Figure 9: ternary RGB global map
+    # ------------------------------------------------------------------
+
+    # Figure 8 plot - same style as Figure 1 and 2
+    hv.extension('matplotlib')
+
+    # Ocean color as RGB tuple for NaN/no-data pixels (matches OCEAN_RGB constant)
+    ocean_rgb = np.array([244/255, 252/255, 255/255])  # #F4FCFF
+
+    # Invalid (NaN) pixels are already routed to OCEAN_RGB inside
+    # create_ternary_alpha_array, so no white-sentinel replacement is needed.
+
+    # Create xarray DataArray with RGB data
+    rgb_da = xr.DataArray(
+        rgb,
+        coords={'y': ds.y, 'x': ds.x, 'band': ['R', 'G', 'B']},
+        dims=['y', 'x', 'band']
+    )
+
+    # Free the full-resolution input layers now that rgb is built; the insets
+    # below are sliced straight from rgb_da, so ds data variables are no longer
+    # needed.  This keeps the render comfortably within the memory budget.
+    ds = ds.drop_vars(['esri', 'hm', 'cpi'])
+
+    # Create the main RGB plot with same frame size as Figure 1/2
+    rgb_plot = rgb_da.hvplot.rgb(
+        x='x', y='y', bands='band',
+        frame_width=1000,
+        frame_height=700,
+        pixel_ratio=6,
+        xlabel='Longitude',
+        ylabel='Latitude',
+        rasterize=True,
+        projection=ccrs.Robinson(),
+        global_extent=True,
+    )
+
+    # Render the HoloViews plot to a matplotlib figure
+    fig = hv.render(rgb_plot, backend='matplotlib')
+    ax = fig.axes[0]
+
+    # Set the background color to light blue (ocean color)
+    ax.set_facecolor('#F4FCFF')
+
+    # Add a thin black border around the map region
+    ax.spines['geo'].set_visible(True)
+    ax.spines['geo'].set_edgecolor('black')
+    ax.spines['geo'].set_linewidth(0.3)
+
+    # Remove the default title
+    ax.set_title('')
+
+    # Remove any extra axes (e.g. colorbar) since this is an RGB plot
+    for a in list(fig.axes[1:]):
+        a.remove()
+
+    # Define coordinate reference systems
+    robinson = ccrs.Robinson()
+    platecarree = ccrs.PlateCarree()
+
+    # Define inset map locations (same as Figure 1 and 2)
+    inset_defs = [
+        {'center': (-3.046461, -49.938504), 'anchor': (-30, -105)},   # Para, Brazil
+        {'center': (0.232389,  37.375075),  'anchor': (-30, -13)},    # Northern Kenya
+        {'center': (9.921023,  77.617712),  'anchor': (-30, 77)},     # Southern India
+    ]
+
+    # Set the radius of each circular inset in degrees
+    radius_deg = 2.0
+
+    # Set the size of inset axes as a fraction of figure size
+    inset_size = 0.085
+
+    # Create each inset map
+    for ins in inset_defs:
+        # Extract center coordinates (where to zoom in) and anchor coordinates (where to place inset)
+        clat, clon = ins['center']
+        alat, alon = ins['anchor']
+
+        # Transform anchor point from lat/lon to Robinson projection coordinates
+        x_rob, y_rob = robinson.transform_point(alon, alat, platecarree)
+
+        # Convert Robinson data coordinates to display coordinates
+        disp = ax.transData.transform([x_rob, y_rob])
+
+        # Convert display coordinates to figure coordinates (0-1 range)
+        fx, fy = fig.transFigure.inverted().transform(disp)
+
+        # Create inset axes centered on the anchor point
+        ax_ins = fig.add_axes(
+            [fx - inset_size / 2, fy - inset_size / 2, inset_size, inset_size],
+            projection=platecarree
+        )
+
+        # Set inset background to ocean color
+        ax_ins.set_facecolor('#F4FCFF')
+
+        # Set the geographic extent of the inset (zoom level)
+        ax_ins.set_extent(
+            [clon - radius_deg, clon + radius_deg, clat - radius_deg, clat + radius_deg],
+            crs=platecarree
+        )
+
+        # Subset the transformed data for the inset region
+        x_sl = slice(clon - radius_deg - 0.1, clon + radius_deg + 0.1)
+        y_sl = slice(clat + radius_deg + 0.1, clat - radius_deg - 0.1)
+
+        # Slice the inset straight out of the already-computed RGB (identical pixels
+        # to the main map; no recompute, no dependence on the freed ds layers).
+        sub_rgb_da = rgb_da.sel(x=x_sl, y=y_sl)
+        sub_rgb = sub_rgb_da.values
+        sub_x = sub_rgb_da.x.values
+        sub_y = sub_rgb_da.y.values
+
+        # Plot the RGB subset in the inset
+        ax_ins.imshow(
+            sub_rgb,
+            extent=[float(sub_x.min()), float(sub_x.max()),
+                    float(sub_y.min()), float(sub_y.max())],
+            transform=platecarree,
+            origin='upper',
+            interpolation='nearest'
+        )
+
+        # Create a circular boundary path for the inset
+        theta = np.linspace(0, 2 * np.pi, 200)
+        verts = np.column_stack([
+            clon + radius_deg * np.cos(theta),
+            clat + radius_deg * np.sin(theta)
+        ])
+        codes = [mpath.Path.MOVETO] + [mpath.Path.LINETO] * (len(theta) - 1)
+        circle_path = mpath.Path(verts, codes)
+
+        # Apply circular boundary to clip the inset
+        ax_ins.set_boundary(circle_path, transform=platecarree)
+
+        # Add a thin black border around the circular inset
+        border = Circle((0.5, 0.5), 0.5, transform=ax_ins.transAxes,
+                        facecolor='none', edgecolor='black', linewidth=0.3, zorder=6)
+        ax_ins.add_patch(border)
+
+        # Remove tick marks from inset
+        ax_ins.set_xticks([])
+        ax_ins.set_yticks([])
+
+        # Hide inset spines
+        for spine in ax_ins.spines.values():
+            spine.set_visible(False)
+
+        ax.spines['geo'].set_visible(True)
+        ax.spines['geo'].set_edgecolor('black')
+        ax.spines['geo'].set_linewidth(0.3)
+
+        # Add a hollow circle marker on the main map showing the inset location
+        x_loc, y_loc = robinson.transform_point(clon, clat, platecarree)
+        ax.plot(x_loc, y_loc, 'o', color='black', markersize=4,
+                markerfacecolor='none', markeredgewidth=0.4,
+                transform=ax.transData, zorder=10)
+
+    # Save the figure at high resolution
+    fig.savefig(str(OUT / 'fig9_rgb_map.png'), dpi=config.DPI_MAP, bbox_inches='tight')
+    # Figure 8 saved to v2/fig8_rgb_map.png
+
+    # ------------------------------------------------------------------
+    # Figure 9 legend
+    # ------------------------------------------------------------------
+    utils.plot_ternary_alpha_legend(OUT / 'fig9_ternary_alpha_legend.png')
+
+
+def figS5():
+    """Figure S5: HM change 2020->2040 as 11 regional zooms (Fig 1/2 styling)."""
+    OUT.mkdir(parents=True, exist_ok=True)
+    OCEAN = config.OCEAN_HEX
+    TARGET_PX = config.TARGET_PX_ZOOM
+    cmap = mcolors.LinearSegmentedColormap.from_list("my_custom_coolwarm", config.COOLWARM_STOPS)
+    vmin, vmax = config.CLIM
+    cbar_label = "HM change 2040-2020"
+
+    def load_hm():
+        da = rxr.open_rasterio(config.PATHS['hm_diff'], chunks="auto").squeeze(drop=True)
+        return da.where((da >= -1) & (da <= 1))
+
+    def subset_region(da, bbox, margin=1.0):
+        lon0, lon1, lat0, lat1 = bbox
+        x_asc = float(da.x[-1]) > float(da.x[0])
+        y_asc = float(da.y[-1]) > float(da.y[0])
+        xs = slice(lon0 - margin, lon1 + margin) if x_asc else slice(lon1 + margin, lon0 - margin)
+        ys = slice(lat0 - margin, lat1 + margin) if y_asc else slice(lat1 + margin, lat0 - margin)
+        sub = da.sel(x=xs, y=ys)
+        ny, nx = sub.sizes["y"], sub.sizes["x"]
+        stride = max(1, int(np.ceil(max(ny, nx) / TARGET_PX)))
+        return sub.isel(x=slice(None, None, stride), y=slice(None, None, stride)).compute()
+
+    def render(name, slug, bbox, sub):
+        fig = plt.figure(figsize=(9, 7))
+        ax = fig.add_subplot(projection=ccrs.Robinson())
+        ax.set_facecolor(OCEAN)
+        mesh = ax.pcolormesh(
+            sub.x.values, sub.y.values, sub.values,
+            transform=ccrs.PlateCarree(), cmap=cmap, vmin=vmin, vmax=vmax,
+            shading="auto", rasterized=True,
+        )
+        ax.set_extent(list(bbox), crs=ccrs.PlateCarree())
+        ax.spines["geo"].set_edgecolor("black")
+        ax.spines["geo"].set_linewidth(0.4)
+        ax.set_title(name, fontsize=13)
+        cbar = fig.colorbar(mesh, ax=ax, orientation="vertical",
+                            shrink=0.55, pad=0.02, extend="both")
+        cbar.set_label(cbar_label, fontsize=8)
+        cbar.ax.tick_params(labelsize=7, width=0.4, length=2)
+        cbar.outline.set_linewidth(0.3)
+        out = OUT / f"figS5_{slug}.png"
+        fig.savefig(out, dpi=config.DPI_PLOT, bbox_inches="tight")
+        plt.close(fig)
+        return out
+
+    da = load_hm()
+    for slug, (name, bbox) in config.REGIONS.items():
+        sub = subset_region(da, bbox)
+        out = render(name, slug, bbox, sub)
+        print(f"  saved {out.name}  ({sub.sizes['y']}x{sub.sizes['x']} cells)", flush=True)
+
+
+def figS6():
+    """Figure S6: 2040 natural-lands forecast classes as 11 regional zooms."""
+    from matplotlib.patches import Patch
+    OUT.mkdir(parents=True, exist_ok=True)
+    OCEAN = config.OCEAN_HEX
+    TARGET_PX = config.TARGET_PX_ZOOM
+    class_colors = config.CLASS_COLORS
+    class_labels = config.CLASS_LEGEND_LABELS
+    cmap = mcolors.ListedColormap(class_colors)
+    norm = mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5], cmap.N)
+
+    def load_layers():
+        raster = rxr.open_rasterio(config.PATHS['raster_classes'], chunks="auto").squeeze(drop=True)
+        hm = rxr.open_rasterio(config.PATHS['hm_diff'], chunks="auto").squeeze(drop=True)
+        return raster, hm
+
+    def subset_region(raster, hm, bbox, margin=1.0):
+        lon0, lon1, lat0, lat1 = bbox
+        x_asc = float(raster.x[-1]) > float(raster.x[0])
+        y_asc = float(raster.y[-1]) > float(raster.y[0])
+        xs = slice(lon0 - margin, lon1 + margin) if x_asc else slice(lon1 + margin, lon0 - margin)
+        ys = slice(lat0 - margin, lat1 + margin) if y_asc else slice(lat1 + margin, lat0 - margin)
+        rsub = raster.sel(x=xs, y=ys)
+        ny, nx = rsub.sizes["y"], rsub.sizes["x"]
+        stride = max(1, int(np.ceil(max(ny, nx) / TARGET_PX)))
+        rsub = rsub.isel(x=slice(None, None, stride), y=slice(None, None, stride)).compute()
+        hsub = hm.sel(x=rsub.x, y=rsub.y, method="nearest").compute()
+        vals = rsub.values.astype("float32")
+        ocean = ~(hsub.values > -1e30)
+        vals[ocean] = np.nan
+        vals[(vals < 0) | (vals > 4)] = np.nan
+        return rsub.x.values, rsub.y.values, vals
+
+    def render(name, slug, bbox, x, y, vals):
+        fig = plt.figure(figsize=(9, 7))
+        ax = fig.add_subplot(projection=ccrs.Robinson())
+        ax.set_facecolor(OCEAN)
+        ax.pcolormesh(
+            x, y, vals, transform=ccrs.PlateCarree(), cmap=cmap, norm=norm,
+            shading="auto", rasterized=True,
+        )
+        ax.set_extent(list(bbox), crs=ccrs.PlateCarree())
+        ax.spines["geo"].set_edgecolor("black")
+        ax.spines["geo"].set_linewidth(0.4)
+        ax.set_title(name, fontsize=13)
+        handles = [Patch(facecolor=c, edgecolor="0.3", linewidth=0.3, label=lab)
+                   for c, lab in zip(class_colors, class_labels)]
+        ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5),
+                  fontsize=7, frameon=False, handlelength=1.2, handleheight=1.2,
+                  borderaxespad=0.0)
+        out = OUT / f"figS6_{slug}.png"
+        fig.savefig(out, dpi=config.DPI_PLOT, bbox_inches="tight")
+        plt.close(fig)
+        return out
+
+    raster, hm = load_layers()
+    for slug, (name, bbox) in config.REGIONS.items():
+        x, y, vals = subset_region(raster, hm, bbox)
+        out = render(name, slug, bbox, x, y, vals)
+        print(f"  saved {out.name}  ({vals.shape[0]}x{vals.shape[1]} cells)", flush=True)
+
+
+def fig10():
+    """Figure 10: unprotected intact-lands loss 2020->2040 (maps + radials) + stats CSV.
+
+    Also writes unprotected_loss_stats.csv, consumed by tables_s2_s9().
+    """
+    import gc
+    import os
+    import matplotlib.patches as mpatches
+    import geopandas as gpd
+    from rasterio.features import rasterize
+
+    OUT.mkdir(parents=True, exist_ok=True)
+    DATA = config.DATA_DIR
+    PATH_HM_2020 = config.PATHS['hm_observed_2020']
+    PATH_HM_CENTRAL = config.PATHS['hm_central_2040']
+    PATH_HM_UPPER = config.PATHS['hm_upper_2040']
+    PATH_PA = config.PATHS['hm_static_iucn_strict']
+    PATH_ECO = DATA / 'Ecoregions2017' / 'Ecoregions2017.shp'
+
+    INTACT_THRESHOLD = 0.1
+    PROTECTED_VALUE = 1.0
+    COARSEN = 4
+
+    COLOR_PROTECTED = '#a8e47e'
+    COLOR_REDBROWN = '#a28181'
+    COLOR_LOST = '#e99060'
+    COLOR_PERSISTENT = '#c0c0c0'
+    COLOR_LAND_BASE = '#E0E0E0'
+    COLOR_OCEAN = '#F4FCFF'
+
+    def _load_raster(path: Path) -> xr.DataArray:
+        da = rxr.open_rasterio(str(path), chunks=None).squeeze('band', drop=True)
+        return da.where((da >= 0.0) & (da <= 1.0))
+
+
+    def _summary(name: str, mask: np.ndarray) -> None:
+        print(f"  {name}: {int(mask.sum()):,} pixels")
+
+
+    def plot_loss_map(lost_mask: np.ndarray, land_mask: np.ndarray,
+                      x_coords: np.ndarray, y_coords: np.ndarray,
+                      out_path: Path) -> None:
+        # Ternary encoding so we can coarsen the three states in one .max() pass:
+        # 0 = ocean, 1 = land but not lost, 2 = lost. .max() preserves the highest-priority class.
+        combined = land_mask.astype(np.uint8)
+        combined[lost_mask] = 2
+        da = xr.DataArray(combined, dims=('y', 'x'),
+                          coords={'x': x_coords, 'y': y_coords})
+        da = da.coarsen(x=COARSEN, y=COARSEN, boundary='trim').max()
+        coarse = da.values
+        x_c = da['x'].values
+        y_c = da['y'].values
+
+        # NaN where ocean so set_facecolor shows through; 0/1 for the cmap stops.
+        display = np.where(coarse == 0, np.nan,
+                           np.where(coarse == 2, 1.0, 0.0)).astype(np.float32)
+
+        cmap = mcolors.LinearSegmentedColormap.from_list(
+            'loss_cmap', [COLOR_LAND_BASE, COLOR_LOST]
+        )
+        cmap.set_bad(color=COLOR_OCEAN, alpha=0.0)  # ocean = transparent → ax facecolor shows
+
+        fig = plt.figure(figsize=(13, 7))
+        ax = plt.axes(projection=ccrs.Robinson())
+        ax.set_global()
+        ax.set_facecolor(COLOR_OCEAN)
+
+        ax.pcolormesh(
+            x_c, y_c, display,
+            cmap=cmap, vmin=0.0, vmax=1.0,
+            transform=ccrs.PlateCarree(),
+            shading='nearest',
+            rasterized=True,
+        )
+
+        ax.spines['geo'].set_visible(True)
+        ax.spines['geo'].set_edgecolor('black')
+        ax.spines['geo'].set_linewidth(0.3)
+
+        fig.savefig(out_path, dpi=config.DPI_MAP, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"  saved {out_path.name}")
+
+
+    def plot_realm_radial(stats: pd.DataFrame, forecast: str, out_path: Path) -> None:
+        pct_p_col = 'pct_protected'                       # static, no forecast suffix
+        pct_rb_col = f'pct_red_brown_{forecast}'
+        pct_l_col = f'pct_lost_{forecast}'
+
+        # Drop Antarctica per request
+        stats = stats[stats['REALM'] != 'Antarctica'].copy()
+
+        realm_totals = stats.groupby('REALM')['eco_land_total'].sum().sort_values(ascending=False)
+        realms = realm_totals.index.tolist()
+
+        # Biomes present anywhere in the data (numbered key for the figure legend)
+        biomes_in_data = (
+            stats[['BIOME_NUM', 'BIOME_NAME']]
+            .drop_duplicates()
+            .sort_values('BIOME_NUM')
+            .reset_index(drop=True)
+        )
+
+        nrows, ncols = 2, 4
+        fig, axes = plt.subplots(nrows, ncols, figsize=(17, 10.5),
+                                 subplot_kw=dict(projection='polar'),
+                                 gridspec_kw=dict(hspace=0.05, wspace=0.30))
+        axes = axes.flatten()
+
+        r_base = 0.05
+        label_radius = 1.12
+        for i in range(nrows * ncols):
+            ax = axes[i]
+            if i >= len(realms):
+                ax.set_visible(False)
+                continue
+            realm = realms[i]
+            df_r = stats[stats['REALM'] == realm]
+            n_arms = len(df_r)
+            if n_arms == 0:
+                ax.set_visible(False)
+                continue
+
+            biomes_here = sorted(df_r['BIOME_NUM'].unique())
+            n_biomes = len(biomes_here)
+            n_slots = n_arms + n_biomes  # 1 arm-width gap per biome group
+            arm_w = 2.0 * np.pi / n_slots
+
+            cursor = 0.0
+            for biome_num in biomes_here:
+                sub = df_r[df_r['BIOME_NUM'] == biome_num].sort_values(
+                    by=[pct_p_col, 'eco_land_total'], ascending=[False, False]
+                )
+                n = len(sub)
+                thetas = cursor + arm_w * (np.arange(n) + 0.5)
+                p = (sub[pct_p_col] / 100.0).values
+                rb = (sub[pct_rb_col] / 100.0).values
+                l = (sub[pct_l_col] / 100.0).values
+                grey = np.clip(1.0 - p - rb - l, 0.0, 1.0)
+
+                # Stack order (centre → rim): protected, grey, lost, red-brown
+                ax.bar(thetas, p, width=arm_w * 0.95, bottom=r_base,
+                       color=COLOR_PROTECTED, linewidth=0, align='center')
+                ax.bar(thetas, grey, width=arm_w * 0.95, bottom=r_base + p,
+                       color=COLOR_PERSISTENT, linewidth=0, align='center')
+                ax.bar(thetas, l, width=arm_w * 0.95, bottom=r_base + p + grey,
+                       color=COLOR_LOST, linewidth=0, align='center')
+                ax.bar(thetas, rb, width=arm_w * 0.95, bottom=r_base + p + grey + l,
+                       color=COLOR_REDBROWN, linewidth=0, align='center')
+
+                # 30%-of-the-bar reference arc, contained within this biome group
+                arc_r = r_base + 0.30
+                arc_theta = np.linspace(cursor, cursor + arm_w * n, 64)
+                ax.plot(arc_theta, np.full_like(arc_theta, arc_r),
+                        color='black', alpha=0.5, linewidth=1.0, zorder=5)
+
+                theta_centre = cursor + arm_w * n / 2.0
+                ax.text(theta_centre, label_radius, str(int(biome_num)),
+                        ha='center', va='center', fontsize=8, fontweight='bold',
+                        color='black')
+
+                cursor += arm_w * (n + 1)  # +1 arm-width gap to next biome
+
+            ax.set_ylim(0.0, label_radius + 0.1)
+            ax.set_yticks([])
+            ax.set_xticks([])
+            ax.spines['polar'].set_visible(False)
+            ax.set_theta_zero_location('N')
+            ax.set_theta_direction(-1)
+            ax.set_title(f"{realm}", fontsize=12, pad=10)
+
+        for j in range(len(realms), len(axes)):
+            axes[j].set_visible(False)
+
+        color_patches = [
+            mpatches.Patch(color=COLOR_PROTECTED, label='Protected'),
+            mpatches.Patch(color=COLOR_LOST, label='Natural lands loss 2040'),
+            mpatches.Patch(color=COLOR_PERSISTENT, label='Still Natural 2040'),
+            mpatches.Patch(color=COLOR_REDBROWN, label='Non-natural 2020'),
+        ]
+        fig.legend(handles=color_patches, loc='lower center', ncol=4,
+                   frameon=False, fontsize=11, bbox_to_anchor=(0.5, 0.115))
+
+        biome_handles = [
+            mpatches.Patch(facecolor='none', edgecolor='none',
+                           label=f"{int(b.BIOME_NUM)} — {b.BIOME_NAME}")
+            for _, b in biomes_in_data.iterrows()
+        ]
+        fig.legend(handles=biome_handles, loc='lower center',
+                   bbox_to_anchor=(0.5, 0.015),
+                   ncol=3, fontsize=9, frameon=False,
+                   handlelength=0, handletextpad=0,
+                   title='Biome key', title_fontsize=10)
+
+        fig.tight_layout(rect=[0.0, 0.20, 1.0, 0.98])
+        fig.savefig(out_path, dpi=config.DPI_PLOT, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"  saved {out_path.name}")
+
+
+    def main() -> None:
+        print("=== plot_unprotected_loss.py ===")
+        OUT.mkdir(parents=True, exist_ok=True)
+
+        # [1] Protected areas
+        print("[1] Loading protected-area raster…")
+        pa_da = _load_raster(PATH_PA)
+        transform = pa_da.rio.transform()
+        shape = pa_da.shape
+        x_coords = pa_da['x'].values
+        y_coords = pa_da['y'].values
+        protected = (pa_da.values == PROTECTED_VALUE)
+        del pa_da
+        _summary("protected", protected)
+
+        # [2] HM 2020
+        print("[2] Loading HM 2020…")
+        hm_2020 = _load_raster(PATH_HM_2020)
+        hm_2020_vals = hm_2020.values
+        land_mask = np.isfinite(hm_2020_vals)
+        intact_2020 = (hm_2020_vals < INTACT_THRESHOLD) & land_mask
+        del hm_2020, hm_2020_vals
+        _summary("land", land_mask)
+        _summary("intact_2020", intact_2020)
+
+        protected_land = protected & land_mask                     # green numerator
+        intact_unprotected = intact_2020 & ~protected
+        unprot_nonintact_2020 = land_mask & ~protected & ~intact_2020  # used to derive red-brown
+        _summary("protected_land", protected_land)
+        _summary("intact_unprotected", intact_unprotected)
+        _summary("unprot_nonintact_2020", unprot_nonintact_2020)
+        del protected
+        gc.collect()
+
+        # [3] HM central
+        print("[3] Loading HM central 2040…")
+        hm_c = _load_raster(PATH_HM_CENTRAL)
+        hm_c_vals = hm_c.values
+        lost_central = intact_unprotected & (hm_c_vals >= INTACT_THRESHOLD)
+        red_brown_central = unprot_nonintact_2020 & (hm_c_vals >= INTACT_THRESHOLD)
+        del hm_c, hm_c_vals
+        gc.collect()
+        _summary("lost_central", lost_central)
+        _summary("red_brown_central", red_brown_central)
+
+        # [4] Map central
+        skip_maps = os.environ.get('SKIP_MAPS') == '1'
+        if not skip_maps:
+            print("[4] Rendering map central…")
+            plot_loss_map(lost_central, land_mask, x_coords, y_coords,
+                          out_path=OUT / 'fig_unprotected_loss_map_central.png')
+        else:
+            print("[4] SKIP_MAPS=1, skipping map central")
+
+        # [5] HM upper
+        print("[5] Loading HM upper 2040…")
+        hm_u = _load_raster(PATH_HM_UPPER)
+        hm_u_vals = hm_u.values
+        lost_upper = intact_unprotected & (hm_u_vals >= INTACT_THRESHOLD)
+        red_brown_upper = unprot_nonintact_2020 & (hm_u_vals >= INTACT_THRESHOLD)
+        del hm_u, hm_u_vals, unprot_nonintact_2020
+        gc.collect()
+        _summary("lost_upper", lost_upper)
+        _summary("red_brown_upper", red_brown_upper)
+        assert lost_upper.sum() >= lost_central.sum(), \
+            "Sanity check failed: lost_upper should be >= lost_central"
+        assert red_brown_upper.sum() >= red_brown_central.sum(), \
+            "Sanity check failed: red_brown_upper should be >= red_brown_central"
+
+        # [6] Map upper
+        if not skip_maps:
+            print("[6] Rendering map upper…")
+            plot_loss_map(lost_upper, land_mask, x_coords, y_coords,
+                          out_path=OUT / 'fig_unprotected_loss_map_upper.png')
+        else:
+            print("[6] SKIP_MAPS=1, skipping map upper")
+        # land_mask is kept — it's the denominator (total ecoregion area) in zonal stats.
+        gc.collect()
+
+        # [7] Rasterize ecoregions
+        print("[7] Rasterizing ecoregions…")
+        eco = gpd.read_file(str(PATH_ECO), encoding='latin1')
+        eco = eco[eco['REALM'].notna() & (eco['REALM'].astype(str) != 'N/A')].reset_index(drop=True)
+        eco['idx'] = np.arange(1, len(eco) + 1, dtype=np.uint16)
+        print(f"  kept {len(eco)} ecoregions across {eco['REALM'].nunique()} realms")
+        shapes_iter = ((g, int(i)) for g, i in zip(eco.geometry, eco['idx']))
+        eco_id = rasterize(shapes_iter, out_shape=shape, transform=transform,
+                           fill=0, dtype='uint16', all_touched=False)
+        flat_id = eco_id.ravel()
+        N = len(eco)
+        del eco_id
+        gc.collect()
+
+        # [8] Zonal stats
+        print("[8] Computing zonal stats…")
+
+        def zonal_sum(mask: np.ndarray) -> np.ndarray:
+            return np.bincount(flat_id, weights=mask.ravel().astype(np.float32),
+                               minlength=N + 1)[1:]
+
+        # Forecast-independent "unprotected & non-natural in 2020" mask (used for the
+        # table export's single 'Non-natural 2020' column).
+        unprot_nonnatural_2020 = land_mask & ~protected_land & ~intact_2020
+
+        stats = pd.DataFrame({
+            'idx': eco['idx'].values,
+            'REALM': eco['REALM'].values,
+            'ECO_NAME': eco['ECO_NAME'].values,
+            'BIOME_NUM': eco['BIOME_NUM'].astype(int).values,
+            'BIOME_NAME': eco['BIOME_NAME'].values,
+            'eco_land_total': zonal_sum(land_mask),
+            'protected_land': zonal_sum(protected_land),
+            'intact_total': zonal_sum(intact_2020),  # kept for reference
+            'unprot_nonnatural_2020': zonal_sum(unprot_nonnatural_2020),
+            'red_brown_central': zonal_sum(red_brown_central),
+            'lost_central': zonal_sum(lost_central),
+            'red_brown_upper': zonal_sum(red_brown_upper),
+            'lost_upper': zonal_sum(lost_upper),
+        })
+        del (flat_id, intact_2020, protected_land, intact_unprotected,
+             red_brown_central, lost_central, red_brown_upper, lost_upper,
+             unprot_nonnatural_2020, land_mask)
+        gc.collect()
+
+        # Drop non-terrestrial biomes (BIOME_NUM 98=Lake, 99=Rock & Ice, etc.)
+        stats = stats[stats['BIOME_NUM'].between(1, 14)].copy()
+        stats = stats[stats['eco_land_total'] > 0].copy()
+        print(f"  {len(stats)} ecoregions across "
+              f"{stats['REALM'].nunique()} realms and "
+              f"{stats['BIOME_NUM'].nunique()} biomes")
+
+        # All percentages are of total ecoregion land area.
+        stats['pct_protected'] = 100.0 * stats['protected_land'] / stats['eco_land_total']
+        stats['pct_unprot_nonnatural_2020'] = (
+            100.0 * stats['unprot_nonnatural_2020'] / stats['eco_land_total']
+        )
+        for f in ('central', 'upper'):
+            stats[f'pct_red_brown_{f}'] = 100.0 * stats[f'red_brown_{f}'] / stats['eco_land_total']
+            stats[f'pct_lost_{f}'] = 100.0 * stats[f'lost_{f}'] / stats['eco_land_total']
+            # grey = everything else (still-intact + recovery + tiny HM-2040 NaN gap)
+            stats[f'pct_grey_{f}'] = (100.0 - stats['pct_protected']
+                                      - stats[f'pct_red_brown_{f}']
+                                      - stats[f'pct_lost_{f}'])
+
+        for f in ('central', 'upper'):
+            s = (stats['pct_protected'] + stats[f'pct_red_brown_{f}']
+                 + stats[f'pct_lost_{f}'] + stats[f'pct_grey_{f}'])
+            assert np.allclose(s, 100.0, atol=0.01), f"closure failed for {f}"
+
+        stats.to_csv(OUT / 'unprotected_loss_stats.csv', index=False)
+        print(f"  saved unprotected_loss_stats.csv")
+
+        # [9-10] Radial plots
+        print("[9] Rendering radial central…")
+        plot_realm_radial(stats, 'central', OUT / 'fig_unprotected_loss_radial_central.png')
+        print("[10] Rendering radial upper…")
+        plot_realm_radial(stats, 'upper', OUT / 'fig_unprotected_loss_radial_upper.png')
+
+        print("=== done ===")
+
+    main()
