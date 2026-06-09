@@ -13,6 +13,15 @@ import xarray as xr
 from sklearn.preprocessing import QuantileTransformer
 from scipy.stats import beta
 
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import matplotlib.path as mpath
+from matplotlib.patches import Circle
+from matplotlib.colors import ListedColormap
+import cartopy.crs as ccrs
+import hvplot.xarray  # noqa: F401  (registers the .hvplot accessor)
+import holoviews as hv
+
 import config
 
 # Module-level numpy views of the ternary constants (the original notebook used
@@ -156,3 +165,161 @@ def create_ternary_alpha_array(ds, v1_var='esri', v2_var='hm', v3_var='cpi',
             alpha_thresholds=thr, alpha_levels=alpha_levels, base_alpha=base_alpha,
             background=background, invalid_color=invalid_color)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Colormaps, dask, satellite fetch, and shared global-map / inset builders
+# ---------------------------------------------------------------------------
+def register_coolwarm_cmap():
+    """Register the 'my_custom_coolwarm' diverging colormap (idempotent)."""
+    custom_cmap_obj = mcolors.LinearSegmentedColormap.from_list(
+        'manual_turbo', config.COOLWARM_STOPS)
+    try:
+        plt.colormaps.register(name='my_custom_coolwarm', cmap=custom_cmap_obj)
+    except ValueError:
+        plt.colormaps.unregister('my_custom_coolwarm')
+        plt.colormaps.register(name='my_custom_coolwarm', cmap=custom_cmap_obj)
+
+
+def register_class_cmap():
+    """Register the 5-class 'raster_classes' colormap (idempotent)."""
+    custom_cmap = ListedColormap(config.CLASS_COLORS)
+    try:
+        plt.colormaps.register(name='raster_classes', cmap=custom_cmap)
+    except ValueError:
+        plt.colormaps.unregister('raster_classes')
+        plt.colormaps.register(name='raster_classes', cmap=custom_cmap)
+
+
+def make_dask_client():
+    """Start a Dask distributed client (used by the heavier map figures)."""
+    from dask.distributed import Client
+    return Client()
+
+
+def fetch_esri_satellite(extent, size=256):
+    """Fetch a square satellite image from ESRI World Imagery REST API."""
+    xmin, xmax, ymin, ymax = extent
+    url = (f"https://server.arcgisonline.com/ArcGIS/rest/services/"
+           f"World_Imagery/MapServer/export?"
+           f"bbox={xmin},{ymin},{xmax},{ymax}&bboxSR=4326&imageSR=4326"
+           f"&size={size},{size}&format=png&f=image")
+    with urllib.request.urlopen(url) as resp:
+        img = plt.imread(io.BytesIO(resp.read()), format='png')
+    return img[:, :, :3]  # drop alpha channel
+
+
+def build_global_robinson_map(pds, *, cmap, clim, cbar_label, hide_geo_spine=False):
+    """Global Robinson quadmesh map with the Figure 1/2 styling.
+
+    Identical to the inline code shared by Figs 2 and S1-S4; the only varying
+    pieces (colormap, clim, colorbar label, initial geo-spine visibility) are
+    arguments. Returns (fig, ax). Insets are added separately via
+    ``add_circular_insets``.
+    """
+    hv.extension('matplotlib')
+    plot = pds.hvplot.quadmesh(
+        x='x', y='y',
+        frame_width=1000,
+        frame_height=700,
+        pixel_ratio=6,
+        xlabel='Longitude',
+        ylabel='Latitude',
+        rasterize=True,
+        projection=ccrs.Robinson(),
+        global_extent=True,
+        cmap=cmap,
+        ).opts(
+        clim=clim
+    )
+    fig = hv.render(plot, backend='matplotlib')
+    ax = fig.axes[0]
+
+    ax.set_facecolor(config.OCEAN_HEX)
+    ax.spines['geo'].set_visible(not hide_geo_spine)
+    ax.spines['geo'].set_edgecolor('black')
+    ax.spines['geo'].set_linewidth(0.3)
+    ax.set_title('')
+
+    for a in fig.axes[1:]:
+        pos = a.get_position()
+        a.set_position([pos.x0, pos.y0 + pos.height * 0.25, pos.width * 0.4, pos.height * 0.3])
+        a.tick_params(labelsize=3, width=0.3, length=2)
+        for spine in a.spines.values():
+            spine.set_linewidth(0.3)
+        a.set_ylabel(cbar_label, fontsize=4)
+
+    return fig, ax
+
+
+def add_circular_insets(fig, ax, pds, *, cmap, vmin, vmax):
+    """Add the 3 circular zoom insets used by Figs 2 and S1-S4.
+
+    ``cmap`` is the registered colormap name; NaNs render as ocean. ``pds`` is
+    the same DataArray plotted in the main map.
+    """
+    robinson = ccrs.Robinson()
+    platecarree = ccrs.PlateCarree()
+
+    inset_cmap = plt.cm.get_cmap(cmap).copy()
+    inset_cmap.set_bad(config.OCEAN_HEX)
+
+    inset_defs = config.INSET_DEFS
+    radius_deg = config.RADIUS_DEG
+    inset_size = config.INSET_SIZE
+
+    for ins in inset_defs:
+        clat, clon = ins['center']
+        alat, alon = ins['anchor']
+
+        x_rob, y_rob = robinson.transform_point(alon, alat, platecarree)
+        disp = ax.transData.transform([x_rob, y_rob])
+        fx, fy = fig.transFigure.inverted().transform(disp)
+
+        ax_ins = fig.add_axes(
+            [fx - inset_size / 2, fy - inset_size / 2, inset_size, inset_size],
+            projection=platecarree
+        )
+        ax_ins.set_facecolor(config.OCEAN_HEX)
+        ax_ins.set_extent(
+            [clon - radius_deg, clon + radius_deg, clat - radius_deg, clat + radius_deg],
+            crs=platecarree
+        )
+
+        sub = pds.sel(
+            x=slice(clon - radius_deg - 0.1, clon + radius_deg + 0.1),
+            y=slice(clat + radius_deg + 0.1, clat - radius_deg - 0.1)
+        )
+
+        ax_ins.pcolormesh(
+            sub.x.values, sub.y.values, sub.values,
+            cmap=inset_cmap, vmin=vmin, vmax=vmax,
+            transform=platecarree, shading='auto'
+        )
+
+        theta = np.linspace(0, 2 * np.pi, 200)
+        verts = np.column_stack([
+            clon + radius_deg * np.cos(theta),
+            clat + radius_deg * np.sin(theta)
+        ])
+        codes = [mpath.Path.MOVETO] + [mpath.Path.LINETO] * (len(theta) - 1)
+        circle_path = mpath.Path(verts, codes)
+        ax_ins.set_boundary(circle_path, transform=platecarree)
+
+        border = Circle((0.5, 0.5), 0.5, transform=ax_ins.transAxes,
+                        facecolor='none', edgecolor='black', linewidth=0.3, zorder=6)
+        ax_ins.add_patch(border)
+
+        ax_ins.set_xticks([])
+        ax_ins.set_yticks([])
+        for spine in ax_ins.spines.values():
+            spine.set_visible(False)
+
+        ax.spines['geo'].set_visible(True)
+        ax.spines['geo'].set_edgecolor('black')
+        ax.spines['geo'].set_linewidth(0.3)
+
+        x_loc, y_loc = robinson.transform_point(clon, clat, platecarree)
+        ax.plot(x_loc, y_loc, 'o', color='black', markersize=4,
+                markerfacecolor='none', markeredgewidth=0.4,
+                transform=ax.transData, zorder=10)
