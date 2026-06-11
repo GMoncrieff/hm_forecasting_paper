@@ -10,6 +10,7 @@ import urllib.request
 
 import numpy as np
 import xarray as xr
+import rioxarray as rxr
 from sklearn.preprocessing import QuantileTransformer
 from scipy.stats import beta
 
@@ -413,3 +414,22 @@ def plot_ternary_alpha_legend(out_path,
 
     fig.savefig(out_path, dpi=config.DPI_PLOT, bbox_inches='tight', facecolor='white')
     plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# HM-change layers, computed live from the AA rasters (replaces the precomputed
+# HM_DIFF.tif / hm_diff_obs.tif). masked=True so declared nodata -> NaN, which
+# preserves the ocean mask through the subtraction (ocean stays NaN, not 0).
+# ---------------------------------------------------------------------------
+def load_hm_diff(chunks='auto'):
+    """HM change 2040-2020 = central 2040 forecast - observed 2020 (live)."""
+    central = rxr.open_rasterio(config.PATHS['hm_central_2040'], chunks=chunks, masked=True)
+    obs2020 = rxr.open_rasterio(config.PATHS['hm_2020_aa'], chunks=chunks, masked=True)
+    return central - obs2020
+
+
+def load_hm_diff_obs(chunks='auto'):
+    """Observed HM change 2020-2000 = observed 2020 - observed 2000 (live)."""
+    obs2020 = rxr.open_rasterio(config.PATHS['hm_2020_aa'], chunks=chunks, masked=True)
+    obs2000 = rxr.open_rasterio(config.PATHS['hm_2000_aa'], chunks=chunks, masked=True)
+    return obs2020 - obs2000

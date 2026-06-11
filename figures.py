@@ -32,7 +32,7 @@ def fig2_3():
     utils.register_coolwarm_cmap()
 
     # ---- Figure 2 (shared global-map builder) ----
-    ds = rxr.open_rasterio(config.PATHS['hm_diff'], chunks='auto')
+    ds = utils.load_hm_diff()
     ds = ds.to_dataset(name="hm")
     ds = ds.drop('band')
     ds = ds.squeeze()
@@ -304,7 +304,7 @@ def figS1_S4():
     utils.register_coolwarm_cmap()
 
     # ---- Figure S1: observed HM change 2020-2000 ----
-    dsobs = rxr.open_rasterio(config.PATHS['hm_diff_obs'], chunks='auto')
+    dsobs = utils.load_hm_diff_obs()
     dsobs = dsobs.to_dataset(name="hm")
     ds = dsobs.drop('band')
     ds = ds.squeeze()
@@ -1132,7 +1132,7 @@ def fig8_9():
     utils.register_coolwarm_cmap()
     esri = rxr.open_rasterio(config.PATHS['esri_hm'], chunks='auto')
     cpi = rxr.open_rasterio(config.PATHS['cpi_hm'], chunks='auto')
-    hm = rxr.open_rasterio(config.PATHS['hm_diff'], chunks='auto')
+    hm = utils.load_hm_diff()
 
     ds = xr.Dataset({
         "esri": esri,
@@ -1457,7 +1457,7 @@ def figS5():
     cbar_label = "HM change 2040-2020"
 
     def load_hm():
-        da = rxr.open_rasterio(config.PATHS['hm_diff'], chunks="auto").squeeze(drop=True)
+        da = utils.load_hm_diff().squeeze(drop=True)
         return da.where((da >= -1) & (da <= 1))
 
     def subset_region(da, bbox, margin=1.0):
@@ -1514,7 +1514,7 @@ def figS6():
 
     def load_layers():
         raster = rxr.open_rasterio(config.PATHS['raster_classes'], chunks="auto").squeeze(drop=True)
-        hm = rxr.open_rasterio(config.PATHS['hm_diff'], chunks="auto").squeeze(drop=True)
+        hm = utils.load_hm_diff().squeeze(drop=True)
         return raster, hm
 
     def subset_region(raster, hm, bbox, margin=1.0):
