@@ -6,8 +6,7 @@ from pathlib import Path
 
 # --- locations ---
 REPO_DIR = Path(__file__).resolve().parent
-DATA_DIR = REPO_DIR.parent / "data"     # reuse existing ../data (no duplication)
-V2_DIR = REPO_DIR.parent / "v2"         # legacy dir holding the covariates xlsx
+DATA_DIR = REPO_DIR / "data"     # reuse existing ../data (no duplication)
 OUTPUT_DIR = REPO_DIR / "output"
 
 # --- which outputs to generate (edit to disable) ---
@@ -55,7 +54,7 @@ PATHS = {
     "pred_2010_lower": DATA_DIR / "prediction_2010_lower_blended.tif",
     "pred_2015_lower": DATA_DIR / "prediction_2015_lower_blended.tif",
     "pred_2020_lower": DATA_DIR / "prediction_2020_lower_blended.tif",
-    "covariates_xlsx": V2_DIR / "Supplementary_Table_S2_covariates.xlsx",
+    "covariates_xlsx": DATA_DIR / "Supplementary_Table_S2_covariates.xlsx",
 }
 # NOTE: fig10 / S5 / S6 reference further inputs (PA raster, ecoregions, 2040
 # blended). Add any further paths the ported bodies require, here, during

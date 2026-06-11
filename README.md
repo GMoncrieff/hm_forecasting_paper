@@ -28,9 +28,6 @@ mamba env create -f environment.yml   # or: conda env create -f environment.yml
 mamba activate hm_plots
 ```
 
-(`environment.yml` was exported from the working `hm_plots` env. `pytest` is not
-included; the test files are plain assertion functions and can also be run with
-`pytest` if you install it.)
 
 ## Configure
 
@@ -81,18 +78,6 @@ and prints a summary of what ran, was skipped, or failed.
 `fig10` first automatically if the CSV is missing). `make_paper.py` orders Figure 10
 before Tables S2–S9.
 
-## Data availability
-
-Inputs are read from `config.DATA_DIR` (`../data`). At the time this repo was built,
-these inputs were **present**, so their outputs run as-is:
-
-- Figs 2, 3 · Fig S1 · Figs 8, 9 · Figs S5, S6 · Fig 10 · Table S1 · Tables S2–S9
-
-The following inputs were **pruned** from `data/` (only `.aux.xml` sidecars remained):
-the `*_AA_1000.tiff` observed series and the `prediction_*_blended.tif` predictions.
-Until they are restored, these outputs are code-complete but will not run:
-
-- Figs S2, S3, S4 · Figs 4, 5 · Fig SX · Fig 6 · Fig 7
 
 ## Network
 
@@ -100,19 +85,3 @@ Until they are restored, these outputs are code-complete but will not run:
 Imagery REST API, and use cartopy's `stock_img()`/`coastlines()` (Natural Earth data
 is downloaded on first use). An internet connection is required for those three.
 
-## Provenance
-
-Figure bodies were ported from the standalone `plot_*.py` scripts (themselves
-extracted from the original plotting notebooks). Shared scaffolding was factored into
-`utils.py` and parameters into `config.py` without changing visual output. Verified
-**pixel-identical** against the originals (where input data was available): Figs 2, 3,
-S1, 8, S5, S6, 10 (all four panels), and the Tables S2–S9 stats CSV. Figure 9's map +
-legend are produced by the byte-identical ternary code; the original standalone script
-cannot generate a reference for them because its per-figure Dask client OOMs on the
-~8 GB transform (`KilledWorker`) — the refactor drops that per-figure client and
-computes in-process, so Fig 9 now renders reliably.
-
-A few small, output-neutral cleanups were made during the port: the broken/redundant
-`raster_classes.tif` re-export at the end of the Fig 2/3 notebook was dropped, and the
-per-figure Dask `Client()` calls were removed (the default scheduler gives identical
-results).
