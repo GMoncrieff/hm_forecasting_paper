@@ -315,7 +315,7 @@ def figS1_S4():
 
     fig, ax = utils.build_global_robinson_map(
         pds, cmap='my_custom_coolwarm', clim=config.CLIM,
-        cbar_label='HM change 2020-2000', hide_geo_spine=True)
+        cbar_label='HM change 2000-2020', hide_geo_spine=True)
     utils.add_circular_insets(fig, ax, pds, cmap='my_custom_coolwarm',
                               vmin=config.CLIM[0], vmax=config.CLIM[1])
     fig.savefig(OUT / 'figS1_hmdiff_map.png', dpi=config.DPI_MAP, bbox_inches='tight')
@@ -454,7 +454,7 @@ def fig4_5():
 
     ax.set_yscale('log')
     ax.set_title('', fontweight='bold')
-    ax.set_xlabel('HM Change (2020 - 2000)', fontweight='bold', fontsize=13)
+    ax.set_xlabel('HM Change (2000 - 2020)', fontweight='bold', fontsize=13)
     ax.set_ylabel('Count (log scale)', fontweight='bold', fontsize=13)
     ax.set_xticks(x)
     ax.set_xticklabels(bin_labels, rotation=45, ha='right', fontsize=12)
@@ -622,7 +622,7 @@ def figSX():
             # Row 0, col c0+1: satellite basemap
             ax_bm = fig.add_subplot(gs[0, c0 + 1])
             ax_bm.imshow(bm_img, aspect='auto', interpolation='bilinear')
-            ax_bm.set_title('Location', fontsize=14, pad=6)
+            ax_bm.set_title('Satellite imagery', fontsize=14, pad=6)
             ax_bm.set_xticks([]); ax_bm.set_yticks([])
             bm_axes.append(ax_bm)
 
@@ -797,9 +797,10 @@ def fig6():
     print("Done.")
 
     # Format lat/lon with N/S E/W
+    predetermined_labels = ['Muchinga, Zambia','Chaco, Argentina']
     for i, s in enumerate(sites_info):
         lat_s, lon_s = fmt_coord(s['lat_c'], s['lon_c'])
-        print(f"Site {i+1}: {lat_s}, {lon_s}")
+        print(f"{predetermined_labels[i]}: {lat_s}, {lon_s}")
 
     # ---------- build the 5x4 figure ----------
     fig = plt.figure(figsize=(16, 20))
@@ -830,7 +831,7 @@ def fig6():
         # Row 0, col c0+1: satellite basemap
         ax_bm = fig.add_subplot(gs[0, c0 + 1])
         ax_bm.imshow(bm_img, aspect='auto', interpolation='bilinear')
-        ax_bm.set_title('Location', fontsize=14, pad=6)
+        ax_bm.set_title('Satellite imagery', fontsize=14, pad=6)
         ax_bm.set_xticks([]); ax_bm.set_yticks([])
         bm_axes.append(ax_bm)
 
@@ -870,7 +871,7 @@ def fig6():
         x_center = (pos_l.x0 + pos_r.x1) / 2
         y_top = max(pos_l.y1, pos_r.y1) + 0.015
         fig.text(x_center, y_top,
-                 f'Site {s+1}: {lat_s}, {lon_s}',
+                 f'{predetermined_labels[s]}: {lat_s}, {lon_s}',
                  ha='center', va='bottom', fontsize=18, fontweight='bold')
 
     # ---------- colorbars ----------
@@ -1057,6 +1058,7 @@ def fig7():
                               height_ratios=[1, 1.3])
 
         col_map = [0, 1, 3, 4]
+        predetermined_labels = ['Muchinga, Zambia','Chaco, Argentina']
 
         for i, (pxd, col) in enumerate(zip(pixel_data, col_map)):
             s_idx = pxd['site_idx']
@@ -1074,7 +1076,11 @@ def fig7():
                         markeredgecolor='white', markeredgewidth=1.5, zorder=10)
             ax_loc.set_xticks([]); ax_loc.set_yticks([])
             lat_s, lon_s = fmt_coord(pxd['lat'], pxd['lon'])
-            ax_loc.set_title(f'{lat_s}, {lon_s}', fontsize=16, pad=6)
+            if seed == 0:
+                title_str = f'{predetermined_labels[s_idx]}: {lat_s}, {lon_s}'
+            else:
+                title_str = f'{lat_s}, {lon_s}'
+            ax_loc.set_title(title_str, fontsize=12, pad=6)
 
             # Globe inset
             pos = ax_loc.get_position()
@@ -1135,12 +1141,12 @@ def fig8_9():
     hm = utils.load_hm_diff()
 
     ds = xr.Dataset({
-        "esri": esri,
-        "hm": hm,
-        "cpi": cpi
+        "ESRI": esri,
+        "HM": hm,
+        "CPI": cpi
     })
 
-    ds['hm'] = ds['hm'].where(abs(ds['hm']) <= 1)
+    ds['HM'] = ds['HM'].where(abs(ds['HM']) <= 1)
     mask = ds.to_array().notnull().all(dim='variable')
     ds = ds.where(mask)
     print(ds)
@@ -1181,7 +1187,7 @@ def fig8_9():
     # Figure 8: esri/hm/cpi hexbin pair matrix
     # ------------------------------------------------------------------
 
-    cols = ['esri', 'hm', 'cpi']
+    cols = ['ESRI', 'HM', 'CPI']
     plot_data = vals[cols]
 
     g = sns.PairGrid(plot_data, height=3.6, corner=True)
@@ -1204,9 +1210,9 @@ def fig8_9():
     g.map_lower(hexbin_plot)
 
     limits = {
-        'esri': (0, 1),
-        'cpi':  (0, 1),
-        'hm':   (-0.1, 0.3)
+        'ESRI': (0, 1),
+        'CPI':  (0, 1),
+        'HM':   (-0.1, 0.3)
     }
 
     for i, row_var in enumerate(cols):
@@ -1260,7 +1266,7 @@ def fig8_9():
     # We create a new dataset to hold the transformed variables
     ds_transformed = ds.copy(deep=True)
 
-    variables_to_transform = ['esri', 'hm', 'cpi']
+    variables_to_transform = ['ESRI', 'HM', 'CPI']
 
     for var in variables_to_transform:
         print(f"Transforming {var}...")
@@ -1275,7 +1281,7 @@ def fig8_9():
 
     ds = ds_transformed
     ds = ds.drop('band')
-    rgb = create_ternary_alpha_array(ds, "esri", "hm", "cpi")
+    rgb = create_ternary_alpha_array(ds, "ESRI", "HM", "CPI")
 
     # ------------------------------------------------------------------
     # Figure 9: ternary RGB global map
@@ -1300,7 +1306,7 @@ def fig8_9():
     # Free the full-resolution input layers now that rgb is built; the insets
     # below are sliced straight from rgb_da, so ds data variables are no longer
     # needed.  This keeps the render comfortably within the memory budget.
-    ds = ds.drop_vars(['esri', 'hm', 'cpi'])
+    ds = ds.drop_vars(['ESRI', 'HM', 'CPI'])
 
     # Create the main RGB plot with same frame size as Figure 1/2
     rgb_plot = rgb_da.hvplot.rgb(
@@ -1454,7 +1460,7 @@ def figS5():
     TARGET_PX = config.TARGET_PX_ZOOM
     cmap = mcolors.LinearSegmentedColormap.from_list("my_custom_coolwarm", config.COOLWARM_STOPS)
     vmin, vmax = config.CLIM
-    cbar_label = "HM change 2040-2020"
+    cbar_label = "HM change 2020-2040"
 
     def load_hm():
         da = utils.load_hm_diff().squeeze(drop=True)
@@ -1669,7 +1675,7 @@ def fig10():
         nrows, ncols = 2, 4
         fig, axes = plt.subplots(nrows, ncols, figsize=(17, 10.5),
                                  subplot_kw=dict(projection='polar'),
-                                 gridspec_kw=dict(hspace=0.05, wspace=0.30))
+                                 gridspec_kw=dict(hspace=0.05, wspace=0.05))
         axes = axes.flatten()
 
         r_base = 0.05
@@ -1740,7 +1746,7 @@ def fig10():
         color_patches = [
             mpatches.Patch(color=COLOR_PROTECTED, label='Protected'),
             mpatches.Patch(color=COLOR_LOST, label='Natural lands loss 2040'),
-            mpatches.Patch(color=COLOR_PERSISTENT, label='Still Natural 2040'),
+            mpatches.Patch(color=COLOR_PERSISTENT, label='Still natural 2040'),
             mpatches.Patch(color=COLOR_REDBROWN, label='Non-natural 2020'),
         ]
         fig.legend(handles=color_patches, loc='lower center', ncol=4,

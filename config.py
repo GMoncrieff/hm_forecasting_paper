@@ -11,13 +11,13 @@ OUTPUT_DIR = REPO_DIR / "output"
 
 # --- which outputs to generate (edit to disable) ---
 RUN = {
-    "fig2_3": True, "figS1_S4": True, "fig4_5": True, "figSX": True,
-    "fig6": True, "fig7": True, "fig8_9": True, "figS5": True,
-    "figS6": True, "fig10": True, "table_s1": True, "tables_s2_s9": True,
+    "fig2_3": False, "figS1_S4": False, "fig4_5": False, "figSX": False,
+    "fig6": False, "fig7": False, "fig8_9": False, "figS5": False,
+    "figS6": False, "fig10": True, "table_s1": False, "tables_s2_s9": False,
 }
 
 STOP_ON_ERROR = False
-USE_DASK = True
+USE_DASK = False
 
 # --- input paths (logical name -> file) ---
 PATHS = {
@@ -32,13 +32,13 @@ PATHS = {
     "cpi_hm": DATA_DIR / "CPI_HM.tif",
     "split_mask": DATA_DIR / "split_mask_1000.tif",
     "hm_static_iucn_strict": DATA_DIR / "hm_static_iucn_strict_1000.tiff",
-    "hm_2000_aa": DATA_DIR / "HM_2000_AA_1000.tiff",
-    "hm_2005_aa": DATA_DIR / "HM_2005_AA_1000.tiff",
-    "hm_2010_aa": DATA_DIR / "HM_2010_AA_1000.tiff",
-    "hm_2015_aa": DATA_DIR / "HM_2015_AA_1000.tiff",
-    "hm_2020_aa": DATA_DIR / "HM_2020_AA_1000.tiff",
-    "hm_1990_aa": DATA_DIR / "HM_1990_AA_1000.tiff",
-    "hm_1995_aa": DATA_DIR / "HM_1995_AA_1000.tiff",
+    "hm_2000_aa": DATA_DIR / "HM_observed_2000.tiff",
+    "hm_2005_aa": DATA_DIR / "HM_observed_2005.tiff",
+    "hm_2010_aa": DATA_DIR / "HM_observed_2010.tiff",
+    "hm_2015_aa": DATA_DIR / "HM_observed_2015.tiff",
+    "hm_2020_aa": DATA_DIR / "HM_observed_2020.tiff",
+    "hm_1990_aa": DATA_DIR / "HM_observed_1990.tiff",
+    "hm_1995_aa": DATA_DIR / "HM_observed_1995.tiff",
     "pred_2005_central": DATA_DIR / "prediction_2005_central_blended.tif",
     "pred_2010_central": DATA_DIR / "prediction_2010_central_blended.tif",
     "pred_2015_central": DATA_DIR / "prediction_2015_central_blended.tif",
