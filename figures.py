@@ -3,11 +3,20 @@
 Bodies are ported from the standalone plot_*.py scripts; the shared global-map /
 inset scaffolding (Figs 2, S1-S4) is delegated to utils, while Fig 3's
 categorical map and Figs 8/9's RGB map keep their own verbatim bodies.
+
+Area weighting: the source rasters are EPSG:4326, on which a cell's ground area
+falls off with cos(lat), so a pixel tally is not an area. Every *number* here -
+the per-ecoregion shares in fig10, the densities in Figs 4/5, and the sample
+behind Fig 8's panels, the Spearman matrix and Fig 9's colour cut-points - is
+computed after warping onto config.EQUAL_AREA_CRS, where one cell is one
+constant patch of ground. Maps are deliberately left on the native grid, since
+cartopy already renders them area-honestly.
 """
 from pathlib import Path
 import numpy as np
 import xarray as xr
 import rioxarray as rxr
+import rasterio
 import pandas as pd
 import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
@@ -43,7 +52,7 @@ def fig2_3():
 
     fig, ax = utils.build_global_robinson_map(
         pds, cmap='my_custom_coolwarm', clim=config.CLIM,
-        cbar_label='HM change 2040-2020')
+        cbar_label='HM change 2020-2040')
     utils.add_circular_insets(fig, ax, pds, cmap='my_custom_coolwarm',
                               vmin=config.CLIM[0], vmax=config.CLIM[1])
     fig.savefig(OUT / 'fig2_hmdiff_map.png', dpi=config.DPI_MAP, bbox_inches='tight')
@@ -345,39 +354,48 @@ def fig4_5():
     # ------------------------------------------------------------------
     # Data (shared by Figure 4 and Figure 5)
     # ------------------------------------------------------------------
-    # load HM data
-    ds_obs2000 = rxr.open_rasterio(config.PATHS['hm_2000_aa'], chunks='auto')
-    ds_obs = rxr.open_rasterio(config.PATHS['hm_2020_aa'], chunks='auto')
+    # Every count in Figures 4 and 5 is a tally of these cells, so they are
+    # loaded onto the equal-area analysis grid: on the native EPSG:4326 grid a
+    # bar height counts pixels, which over-weights high latitudes.
+    #
+    # masked=True is load-bearing. Opening unmasked leaves nodata as raw
+    # 3.4e38, and ocean-minus-ocean is then exactly 0.0 - finite, inside the
+    # plot range, and indistinguishable from a real "no change" observation.
+    # split_mask == 2 is 73% ocean, so that silently made three quarters of
+    # both figures phantom samples stacked on the origin.
+    import contextlib as _contextlib
+    with _contextlib.ExitStack() as _stack:
+        with rasterio.open(config.PATHS['hm_2020_aa']) as _ref:
+            _grid = utils.equal_area_grid(_ref)
 
-    ds_pred = rxr.open_rasterio(config.PATHS['pred_2020_central'], chunks='auto')
+        def _layer(key, **kw):
+            return utils.open_equal_area_da(_stack, config.PATHS[key], _grid,
+                                            chunks='auto', **kw)
 
-    ds_obsdiff = ds_obs - ds_obs2000
-    ds_preddiff = ds_pred - ds_obs2000
+        ds_obs2000 = _layer('hm_2000_aa')
+        ds_obs = _layer('hm_2020_aa')
+        ds_pred = _layer('pred_2020_central')
+        # Categorical: uint8 classes 0-4, no declared nodata. 255 is absent
+        # from the data, and naming it keeps the VRT uint8 instead of letting
+        # a NaN fill promote it to float64.
+        splitmask = _layer('split_mask', src_nodata=255, fill=255)
 
-    ds_diff = xr.Dataset({
-        'obs': ds_obsdiff,
-        'pred': ds_preddiff
-    })
-    print(ds_diff)
+        ds_diff = xr.Dataset({'obs': ds_obs - ds_obs2000,
+                              'pred': ds_pred - ds_obs2000})
 
-    #lodd mask data
-    splitmask = rxr.open_rasterio(config.PATHS['split_mask'])
-    print(splitmask)
+        # mask to where split == 2 (validation set)
+        val_mask = splitmask == 2
+        ds_diff_masked = ds_diff.where(val_mask, drop=False)
 
-    #mask to where split == 2 (validation set)
-    val_mask = splitmask.isel(band=0) == 2
-    ds_diff_masked = ds_diff.where(val_mask, drop=False)
-
-    # Flatten and drop NaNs
-    obs_vals = ds_diff_masked['obs'].values.ravel()
-    pred_vals = ds_diff_masked['pred'].values.ravel()
+        obs_vals = ds_diff_masked['obs'].values.ravel()
+        pred_vals = ds_diff_masked['pred'].values.ravel()
 
     valid = np.isfinite(obs_vals) & np.isfinite(pred_vals)
     obs_flat = obs_vals[valid]
     pred_flat = pred_vals[valid]
-
-    print(obs_flat)
-    print(pred_flat)
+    del obs_vals, pred_vals, valid
+    print(f"  Fig 4/5 sample: {obs_flat.size:,} equal-area land cells "
+          f"({obs_flat.size * (config.EQUAL_AREA_RES / 1000.0) ** 2:,.0f} km2)")
 
     # ------------------------------------------------------------------
     # Figure 4: obs vs pred hexbin
@@ -409,7 +427,7 @@ def fig4_5():
 
     # Colour bar
     cb = fig.colorbar(hb, ax=ax, pad=0.02)
-    cb.set_label('Count (log scale)', fontsize=14)
+    cb.set_label('Cell count, 1 km equal-area (log scale)', fontsize=14)
     cb.ax.tick_params(labelsize=10)
 
     # Axis labels – using "change" consistently
@@ -455,7 +473,8 @@ def fig4_5():
     ax.set_yscale('log')
     ax.set_title('', fontweight='bold')
     ax.set_xlabel('HM Change (2000 - 2020)', fontweight='bold', fontsize=13)
-    ax.set_ylabel('Count (log scale)', fontweight='bold', fontsize=13)
+    ax.set_ylabel('Cell count, 1 km equal-area (log scale)',
+                  fontweight='bold', fontsize=13)
     ax.set_xticks(x)
     ax.set_xticklabels(bin_labels, rotation=45, ha='right', fontsize=12)
     ax.tick_params(axis='y', labelsize=11)
@@ -1134,53 +1153,73 @@ def fig7():
 
 
 def fig8_9():
+    import contextlib as _contextlib
+
     OUT.mkdir(parents=True, exist_ok=True)
     utils.register_coolwarm_cmap()
-    esri = rxr.open_rasterio(config.PATHS['esri_hm'], chunks='auto')
-    cpi = rxr.open_rasterio(config.PATHS['cpi_hm'], chunks='auto')
-    hm = utils.load_hm_diff()
 
-    ds = xr.Dataset({
-        "ESRI": esri,
-        "HM": hm,
-        "CPI": cpi
-    })
+    def _build(equal_area: bool, stack=None):
+        """The ESRI/HM/CPI stack, on the native grid or the equal-area one.
 
-    ds['HM'] = ds['HM'].where(abs(ds['HM']) <= 1)
-    mask = ds.to_array().notnull().all(dim='variable')
-    ds = ds.where(mask)
+        Fig 9's map is rendered from the native build; every *number* (the
+        Spearman matrix, Fig 8's panels, and the quantile cut-points that set
+        Fig 9's colours) comes from the equal-area build, where one cell is one
+        constant patch of ground.
+        """
+        if equal_area:
+            with rasterio.open(config.PATHS['hm_2020_aa']) as ref:
+                grid = utils.equal_area_grid(ref)
+            get = lambda k: utils.open_equal_area_da(          # noqa: E731
+                stack, config.PATHS[k], grid, chunks='auto')
+            esri, cpi = get('esri_hm'), get('cpi_hm')
+            hm = get('hm_central_2040') - get('hm_2020_aa')
+        else:
+            esri = rxr.open_rasterio(config.PATHS['esri_hm'], chunks='auto')
+            cpi = rxr.open_rasterio(config.PATHS['cpi_hm'], chunks='auto')
+            hm = utils.load_hm_diff()
+
+        out = xr.Dataset({"ESRI": esri, "HM": hm, "CPI": cpi})
+        out['HM'] = out['HM'].where(abs(out['HM']) <= 1)
+        return out.where(out.to_array().notnull().all(dim='variable'))
+
+    ds = _build(equal_area=False)
     print(ds)
 
     # ------------------------------------------------------------------
     # Sample + Spearman correlation
     # ------------------------------------------------------------------
+    # Drawn from the equal-area build, so a uniform draw over cells is a
+    # uniform draw over ground. Sampling the native grid uniformly over-weights
+    # high latitudes and biases both the correlations and Figure 8's panels.
+    with _contextlib.ExitStack() as _stack:
+        ds_ea = _build(equal_area=True, stack=_stack)
+        dims = ('y', 'x') if {'y', 'x'}.issubset(ds_ea.dims) else ('lat', 'lon')
+        stacked = ds_ea.stack(points=dims)
 
-    dims = ('y', 'x') if {'y','x'}.issubset(ds.dims) else ('lat', 'lon')
+        n = 1000_000
+        N = stacked.sizes['points']
+        rng = np.random.default_rng(42)
+        idx = np.sort(rng.choice(N, size=min(n, N), replace=False))
+        sample = stacked.isel(points=idx).load()
 
-    # stack variables and compute a validity mask (any variable non-NaN)
-    stacked = ds.stack(points=dims)
+        # Cut-points for Fig 9, fitted here and applied to the native grid.
+        fit_values = {v: sample[v].values.ravel() for v in ('ESRI', 'HM', 'CPI')}
 
-    n = 1000_000
-    N = stacked.dims['points']
-    rng = np.random.default_rng(42)
-    idx = rng.choice(N, size=min(n, N), replace=False)
-    sample = stacked.isel(points=idx)
-    sample = sample.load()
-    simple = sample.drop(['x','y','points'])
+    simple = sample.drop_vars([c for c in ('x', 'y', 'points') if c in sample.coords])
 
     # get variables as rows (long)
     vals = simple.to_dataframe()  # multi-index (points, variable) -> value
     vals = vals.reset_index()  # columns -> variables
 
-    #drop cols band and spatial_ref and points
-
-    vals = vals.drop(columns=['band', 'spatial_ref', 'points'])
+    vals = vals.drop(columns=[c for c in ('band', 'spatial_ref', 'points')
+                              if c in vals.columns])
     #drop row with any na
     vals = vals.dropna()
-    vals
-    #calc spearman correlation
-    spearman_matrix = vals.corr(method='spearman')
+    #calc spearman correlation - pinned to the three layers so an added column
+    # cannot silently widen the reported matrix
+    spearman_matrix = vals[['ESRI', 'HM', 'CPI']].corr(method='spearman')
 
+    print(f"Spearman rank correlation (equal-area sample, n = {len(vals):,}):")
     print(spearman_matrix)
 
     # ------------------------------------------------------------------
@@ -1270,18 +1309,28 @@ def fig8_9():
 
     for var in variables_to_transform:
         print(f"Transforming {var}...")
+        # Fitted on the equal-area sample, applied to the native array: the
+        # colour scale becomes a function of ground area while the map stays
+        # on its own grid.
         ds_transformed[var] = transform_xarray_layer(
-            ds[var], 
-            a_param=0.8, 
-            b_param=3
+            ds[var],
+            a_param=0.8,
+            b_param=3,
+            fit_values=fit_values[var],
         )
 
-    # Now ds_transformed contains the beta-distributed data 
+    # Now ds_transformed contains the beta-distributed data
     # with all original coordinates (lat, lon) preserved.
 
     ds = ds_transformed
-    ds = ds.drop('band')
-    rgb = create_ternary_alpha_array(ds, "ESRI", "HM", "CPI")
+    ds = ds.drop_vars('band') if 'band' in ds.coords or 'band' in ds.dims else ds
+    # Opacity cut-points likewise come from the equal-area sample, so the
+    # legend's "equal-area bins" claim is true of the rendered map.
+    ternary_fit = {v: transform_xarray_layer(
+        xr.DataArray(fit_values[v]), a_param=0.8, b_param=3,
+        fit_values=fit_values[v]).values for v in variables_to_transform}
+    rgb = create_ternary_alpha_array(ds, "ESRI", "HM", "CPI",
+                                     fit_values=ternary_fit)
 
     # ------------------------------------------------------------------
     # Figure 9: ternary RGB global map
@@ -1572,8 +1621,9 @@ def figS6():
 def fig10():
     """Figure 10: unprotected intact-lands loss 2020->2040 (maps + radials) + stats CSV.
 
-    Also writes unprotected_loss_stats.csv, consumed by tables_s2_s9().
+    Also writes unprotected_loss_stats.csv, consumed by tables_s1_s8().
     """
+    import contextlib
     import gc
     import os
     import matplotlib.patches as mpatches
@@ -1599,13 +1649,38 @@ def fig10():
     COLOR_LAND_BASE = '#E0E0E0'
     COLOR_OCEAN = '#F4FCFF'
 
-    def _load_raster(path: Path) -> xr.DataArray:
-        da = rxr.open_rasterio(str(path), chunks=None).squeeze('band', drop=True)
-        return da.where((da >= 0.0) & (da <= 1.0))
+    def _analysis_grid():
+        """The shared equal-area grid, derived once from the PA raster.
+
+        Every zonal count below is a tally of cells on this grid, so on an
+        equal-area CRS a count IS an area - which is what the CSV's pct_*
+        columns and the Tables S1-S8 captions have always claimed. On the
+        native EPSG:4326 grid they were pixel counts, over-weighting the
+        poleward end of every latitudinally-elongated ecoregion.
+        """
+        with rasterio.open(PATH_PA) as ref:
+            return utils.equal_area_grid(ref)
+
+
+    def _load_raster(path: Path, grid) -> xr.DataArray:
+        """Load `path` onto the equal-area analysis grid.
+
+        All four fig10 inputs are float32, so the default NaN fill applies; the
+        0-1 clamp then also neutralises the +/-3.4e38 nodata these files
+        disagree about.
+        """
+        with contextlib.ExitStack() as stack:
+            da = utils.open_equal_area_da(stack, path, grid)
+            da = da.where((da >= 0.0) & (da <= 1.0))
+            da.load()      # materialise before the VRT closes
+        return da
 
 
     def _summary(name: str, mask: np.ndarray) -> None:
-        print(f"  {name}: {int(mask.sum()):,} pixels")
+        n = int(mask.sum())
+        km2 = n * (config.EQUAL_AREA_RES / 1000.0) ** 2
+        unit = f"cells = {km2:,.0f} km2" if config.EQUAL_AREA_CRS else "pixels"
+        print(f"  {name}: {n:,} {unit}")
 
 
     def plot_loss_map(lost_mask: np.ndarray, land_mask: np.ndarray,
@@ -1636,10 +1711,14 @@ def fig10():
         ax.set_global()
         ax.set_facecolor(COLOR_OCEAN)
 
+        # The masks now live on the equal-area analysis grid, so the source
+        # transform must match it; Robinson still handles the display.
+        src_crs = (ccrs.epsg(config.EQUAL_AREA_CRS.split(':')[1])
+                   if config.EQUAL_AREA_CRS else ccrs.PlateCarree())
         ax.pcolormesh(
             x_c, y_c, display,
             cmap=cmap, vmin=0.0, vmax=1.0,
-            transform=ccrs.PlateCarree(),
+            transform=src_crs,
             shading='nearest',
             rasterized=True,
         )
@@ -1773,9 +1852,15 @@ def fig10():
         print("=== plot_unprotected_loss.py ===")
         OUT.mkdir(parents=True, exist_ok=True)
 
+        # [0] Equal-area analysis grid, shared by every layer and the ecoregions
+        grid = _analysis_grid()
+        if grid is not None:
+            print(f"[0] Analysis grid {config.EQUAL_AREA_CRS} @ "
+                  f"{config.EQUAL_AREA_RES} m -> {grid[2]:,} x {grid[1]:,} cells")
+
         # [1] Protected areas
         print("[1] Loading protected-area raster…")
-        pa_da = _load_raster(PATH_PA)
+        pa_da = _load_raster(PATH_PA, grid)
         transform = pa_da.rio.transform()
         shape = pa_da.shape
         x_coords = pa_da['x'].values
@@ -1786,7 +1871,7 @@ def fig10():
 
         # [2] HM 2020
         print("[2] Loading HM 2020…")
-        hm_2020 = _load_raster(PATH_HM_2020)
+        hm_2020 = _load_raster(PATH_HM_2020, grid)
         hm_2020_vals = hm_2020.values
         land_mask = np.isfinite(hm_2020_vals)
         intact_2020 = (hm_2020_vals < INTACT_THRESHOLD) & land_mask
@@ -1805,7 +1890,7 @@ def fig10():
 
         # [3] HM central
         print("[3] Loading HM central 2040…")
-        hm_c = _load_raster(PATH_HM_CENTRAL)
+        hm_c = _load_raster(PATH_HM_CENTRAL, grid)
         hm_c_vals = hm_c.values
         lost_central = intact_unprotected & (hm_c_vals >= INTACT_THRESHOLD)
         red_brown_central = unprot_nonintact_2020 & (hm_c_vals >= INTACT_THRESHOLD)
@@ -1825,7 +1910,7 @@ def fig10():
 
         # [5] HM upper
         print("[5] Loading HM upper 2040…")
-        hm_u = _load_raster(PATH_HM_UPPER)
+        hm_u = _load_raster(PATH_HM_UPPER, grid)
         hm_u_vals = hm_u.values
         lost_upper = intact_unprotected & (hm_u_vals >= INTACT_THRESHOLD)
         red_brown_upper = unprot_nonintact_2020 & (hm_u_vals >= INTACT_THRESHOLD)
@@ -1852,6 +1937,14 @@ def fig10():
         print("[7] Rasterizing ecoregions…")
         eco = gpd.read_file(str(PATH_ECO), encoding='latin1')
         eco = eco[eco['REALM'].notna() & (eco['REALM'].astype(str) != 'N/A')].reset_index(drop=True)
+        if config.EQUAL_AREA_CRS:
+            # Burn the polygons on the same grid the rasters were warped to, or
+            # the zonal ids would not line up with the masks.
+            eco = eco.to_crs(config.EQUAL_AREA_CRS)
+        # 69 of 846 geometries are invalid in the source shapefile (the count is
+        # identical before and after reprojection); repair them so rasterize
+        # cannot silently drop or mis-burn a ring.
+        eco['geometry'] = eco.geometry.make_valid()
         eco['idx'] = np.arange(1, len(eco) + 1, dtype=np.uint16)
         print(f"  kept {len(eco)} ecoregions across {eco['REALM'].nunique()} realms")
         shapes_iter = ((g, int(i)) for g, i in zip(eco.geometry, eco['idx']))
@@ -1900,7 +1993,13 @@ def fig10():
               f"{stats['REALM'].nunique()} realms and "
               f"{stats['BIOME_NUM'].nunique()} biomes")
 
-        # All percentages are of total ecoregion land area.
+        # All percentages are of total ecoregion land area. On the equal-area
+        # analysis grid every cell is the same ground area, so these ratios are
+        # true area shares; on the native EPSG:4326 grid they were pixel shares
+        # skewed toward the poleward end of each ecoregion.
+        if config.EQUAL_AREA_CRS:
+            cell_km2 = (config.EQUAL_AREA_RES / 1000.0) ** 2
+            stats['eco_land_km2'] = stats['eco_land_total'] * cell_km2
         stats['pct_protected'] = 100.0 * stats['protected_land'] / stats['eco_land_total']
         stats['pct_unprot_nonnatural_2020'] = (
             100.0 * stats['unprot_nonnatural_2020'] / stats['eco_land_total']

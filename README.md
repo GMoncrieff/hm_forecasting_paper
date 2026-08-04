@@ -13,7 +13,9 @@ hm_forecasting_paper/
   utils.py         # shared helpers: colormaps, global-map + inset builders, ESRI fetch,
                    #   ternary colour scheme, coordinate formatting
   figures.py       # one function per figure group (fig2_3 … fig10, figS1_S4, figSX, figS5, figS6)
-  tables.py        # table_s1(), tables_s2_s9()
+  tables.py        # table_1(), tables_s1_s8()
+  stats.py         # standalone console summary statistics (not part of make_paper.py)
+  equal_area.py    # shared equal-area analysis grid (leaf module: numpy + rasterio only)
   tests/           # lightweight unit tests for the pure utils + config + orchestrator
   environment.yml  # exported hm_plots conda/mamba environment
   output/          # generated figures/tables (gitignored)
@@ -42,7 +44,16 @@ Everything tunable lives in `config.py`:
 - **`DPI_MAP`** (600) / **`DPI_PLOT`** (300), colours, clim, inset locations, ternary
   thresholds, and the S5/S6 region list.
 - **`STOP_ON_ERROR`** (default `False`) — keep going if one output fails.
-- **`USE_DASK`** (default `True`) — start a Dask client for the heavier rasters.
+- **`USE_DASK`** (default `False`) — start a Dask client for the heavier rasters.
+- **`TABLE_FORMAT`** (default `"pdf"`) — `"pdf"`, `"docx"`, or `"both"` for Table 1 and Tables S1–S8.
+- **`EQUAL_AREA_CRS`** / **`EQUAL_AREA_RES`** / **`EQUAL_AREA_RESAMPLING`**
+  (default `"EPSG:6933"` / `1000` m / `"nearest"`) — see **Area weighting** below.
+  Set `EQUAL_AREA_CRS = None` to revert to native-grid pixel counts.
+
+## Area weighting
+
+The source rasters are EPSG:4326 at 0.009°. Every reported quantity is computed after warping the inputs onto a shared equal-area grid (EPSG:6933, NSIDC EASE-Grid 2.0 Global, at 1 km, nearest-neighbour).
+
 
 ## Run
 
@@ -69,14 +80,14 @@ and prints a summary of what ran, was skipped, or failed.
 | Figure S5 | `figS5` | `figS5_<region>.png` (×11) |
 | Figure S6 | `figS6` | `figS6_<region>.png` (×11) |
 | Figure 10 | `fig10` | `fig_unprotected_loss_map_{central,upper}.png`, `fig_unprotected_loss_radial_{central,upper}.png`, `unprotected_loss_stats.csv` |
-| Table S1 | `table_s1` | `Supplementary_Table_S1_covariates.pdf` |
-| Tables S2–S9 | `tables_s2_s9` | `realm_tables/*.csv`, `realm_tables.pdf` |
+| Table 1 | `table_1` | `Table_1_covariates.pdf` |
+| Tables S1–S8 | `tables_s1_s8` | `realm_tables/*.csv`, `realm_tables.pdf` |
 
 ## Pipeline dependency
 
-`fig10` computes `unprotected_loss_stats.csv`; `tables_s2_s9` consumes it (and runs
+`fig10` computes `unprotected_loss_stats.csv`; `tables_s1_s8` consumes it (and runs
 `fig10` first automatically if the CSV is missing). `make_paper.py` orders Figure 10
-before Tables S2–S9.
+before Tables S1–S8.
 
 
 ## Network

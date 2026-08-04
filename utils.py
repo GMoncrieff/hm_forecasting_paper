@@ -6,11 +6,14 @@ in a later section. All values come from ``config`` so the figures stay
 byte-identical to the original standalone scripts.
 """
 import io
+import math
 import urllib.request
+from pathlib import Path
 
 import numpy as np
 import xarray as xr
 import rioxarray as rxr
+import rasterio
 from sklearn.preprocessing import QuantileTransformer
 from scipy.stats import beta
 
@@ -24,6 +27,7 @@ import hvplot.xarray  # noqa: F401  (registers the .hvplot accessor)
 import holoviews as hv
 
 import config
+import equal_area
 
 # Module-level numpy views of the ternary constants (the original notebook used
 # np.array defaults; reproducing them keeps the maths identical).
@@ -38,10 +42,22 @@ def fmt_coord(lat, lon):
     return lat_s, lon_s
 
 
-def transform_xarray_layer(da, a_param=0.8, b_param=3, random_state=42):
+def transform_xarray_layer(da, a_param=0.8, b_param=3, random_state=42,
+                           fit_values=None):
     """Applies Quantile Transform -> Beta Transform to a single xarray DataArray.
 
     Handles NaNs automatically (masks them out during transformation).
+
+    `fit_values` is a 1-D array the quantile map is *fitted* on, while the
+    transform is applied to `da` itself. Passing an equal-area sample makes the
+    colour scale reflect how much ground lies below a value rather than how
+    many pixels, without moving the rendered map off its native grid.
+
+    Two things this pins down that the bare sklearn call did not:
+      * subsample - QuantileTransformer defaults to subsample=10_000, so the
+        map was previously fitted on 10,000 pixels out of ~150 million. The
+        fit basis is now explicit and the whole of it is used.
+      * n_quantiles is taken from the fit basis, not from the applied array.
     """
     values_flat = da.values.flatten()
     valid_mask = ~np.isnan(values_flat)
@@ -51,10 +67,18 @@ def transform_xarray_layer(da, a_param=0.8, b_param=3, random_state=42):
 
     valid_data = values_flat[valid_mask].reshape(-1, 1)
 
+    basis = valid_data if fit_values is None else np.asarray(
+        fit_values, dtype=np.float64).ravel()[:, None]
+    basis = basis[np.isfinite(basis[:, 0])]
+    if basis.size == 0:
+        basis = valid_data
+
     qt = QuantileTransformer(output_distribution='uniform',
                              random_state=random_state,
-                             n_quantiles=min(len(valid_data), 1000))
-    uniform_data = qt.fit_transform(valid_data)
+                             n_quantiles=min(len(basis), 1000),
+                             subsample=len(basis))
+    qt.fit(basis)
+    uniform_data = qt.transform(valid_data)
 
     transformed_valid = beta.ppf(uniform_data, a_param, b_param)
 
@@ -134,8 +158,16 @@ def create_ternary_alpha_array(ds, v1_var='esri', v2_var='hm', v3_var='cpi',
                                transparent_q=config.TRANSPARENT_Q,
                                alpha_levels=config.ALPHA_LEVELS,
                                base_alpha=config.BASE_ALPHA, block_rows=512,
-                               sample_per_block=200_000):
-    """xarray wrapper for ternary_alpha_rgb, two-pass and processed in row-blocks."""
+                               sample_per_block=200_000, fit_values=None):
+    """xarray wrapper for ternary_alpha_rgb, two-pass and processed in row-blocks.
+
+    `fit_values` is a dict of {var: 1-D array} drawn from the equal-area grid.
+    When given, the opacity cut-points are percentiles of *ground area* and the
+    map is merely rendered on the native grid. Without it the cut-points fall
+    back to the native-grid stride below, which is not area-fair: capping every
+    512-row band at `sample_per_block` equalises latitude bands rather than
+    land, discarding both the cos(lat) weighting and the land fraction.
+    """
     def _da(name):
         da = ds[name]
         return da.squeeze('band') if 'band' in da.dims else da
@@ -144,19 +176,30 @@ def create_ternary_alpha_array(ds, v1_var='esri', v2_var='hm', v3_var='cpi',
     H, W = d1.shape
 
     pts = _alpha_percentile_points(transparent_q, alpha_levels)
-    samples = []
-    for y0 in range(0, H, block_rows):
-        sl = slice(y0, min(y0 + block_rows, H))
-        mb = np.maximum(np.maximum(d1.isel(y=sl).values, d2.isel(y=sl).values),
-                        d3.isel(y=sl).values)
-        v = mb[np.isfinite(mb)]
-        if v.size:
-            step = max(1, v.size // sample_per_block)
-            samples.append(v[::step])
-    allv = np.concatenate(samples) if samples else np.array([0.0], dtype=np.float32)
+    if fit_values is not None:
+        stackedv = np.maximum(np.maximum(fit_values[v1_var], fit_values[v2_var]),
+                              fit_values[v3_var])
+        allv = stackedv[np.isfinite(stackedv)]
+        basis = 'equal-area sample'
+    else:
+        samples = []
+        for y0 in range(0, H, block_rows):
+            sl = slice(y0, min(y0 + block_rows, H))
+            mb = np.maximum(np.maximum(d1.isel(y=sl).values, d2.isel(y=sl).values),
+                            d3.isel(y=sl).values)
+            v = mb[np.isfinite(mb)]
+            if v.size:
+                step = max(1, v.size // sample_per_block)
+                samples.append(v[::step])
+        allv = (np.concatenate(samples) if samples
+                else np.array([0.0], dtype=np.float32))
+        basis = 'native-grid stride (NOT area-fair)'
+    if allv.size == 0:
+        allv = np.array([0.0], dtype=np.float32)
     thr = np.percentile(allv, pts).astype(np.float32)
     print(f"  opacity thresholds @ pct {np.round(pts,2).tolist()} -> "
-          f"max-values {np.round(thr,4).tolist()}  (n_sample={allv.size:,})", flush=True)
+          f"max-values {np.round(thr,4).tolist()}  "
+          f"(n_sample={allv.size:,}, {basis})", flush=True)
 
     out = np.empty((H, W, 3), dtype=np.float32)
     for y0 in range(0, H, block_rows):
@@ -407,13 +450,49 @@ def plot_ternary_alpha_legend(out_path,
     for sp in axbar.spines.values():
         sp.set_visible(False)
     axbar.set_xlabel(
-        "Opacity  =  magnitude percentile of max(ESRI, HM, CPI)\n"
-        f"≤ {int(q0)}th pct → transparent      ·      top {int(100 - q0)}% → "
-        f"{n_lv} equal-count bins, rising to opaque",
+        "Opacity  =  area-weighted magnitude percentile of max(ESRI, HM, CPI)\n"
+        f"≤ {int(q0)}th pct of land area → transparent      ·      "
+        f"top {int(100 - q0)}% → {n_lv} equal-area bins, rising to opaque",
         fontsize=9)
 
     fig.savefig(out_path, dpi=config.DPI_PLOT, bbox_inches='tight', facecolor='white')
     plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Equal-area analysis grid.
+#
+# The source rasters are EPSG:4326, where a cell's ground area falls off with
+# cos(lat), so counting pixels on that grid over-weights high latitudes. Every
+# statistic in the paper is therefore computed on a shared equal-area grid
+# (config.EQUAL_AREA_CRS), onto which layers are warped on the fly. Maps are
+# NOT warped - they render through cartopy, which handles area honestly, and
+# leaving them on the native grid avoids re-plumbing every PlateCarree call.
+# ---------------------------------------------------------------------------
+
+# The grid machinery itself is a leaf module (numpy + rasterio only) so the
+# stats.py console script can import it without pulling in matplotlib,
+# cartopy and holoviews behind it. Re-exported here for the figure code.
+AUTHALIC_RADIUS_M = equal_area.AUTHALIC_RADIUS_M
+equal_area_grid = equal_area.equal_area_grid
+open_equal_area = equal_area.open_equal_area
+read_masked = equal_area.read_masked
+
+
+def open_equal_area_da(stack, path, grid, *, chunks=None, **kwargs):
+    """`open_equal_area` as an xarray DataArray, for the rioxarray call sites.
+
+    Always opens masked=True, so every nodata convention becomes NaN. Loading
+    unmasked is what let 3.4e38 survive into arithmetic elsewhere in this repo:
+    ocean minus ocean is exactly 0.0, which is finite, in range, and reads as a
+    genuine "no change" observation.
+
+    The returned array stays lazy when `chunks` is given; keep `stack` alive
+    until it has been computed, or the underlying VRT closes beneath dask.
+    """
+    layer = open_equal_area(stack, path, grid, **kwargs)
+    da = rxr.open_rasterio(layer, masked=True, chunks=chunks)
+    return da.squeeze('band', drop=True) if 'band' in da.dims else da
 
 
 # ---------------------------------------------------------------------------

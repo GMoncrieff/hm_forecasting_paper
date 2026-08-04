@@ -11,13 +11,38 @@ OUTPUT_DIR = REPO_DIR / "output"
 
 # --- which outputs to generate (edit to disable) ---
 RUN = {
-    "fig2_3": False, "figS1_S4": False, "fig4_5": False, "figSX": False,
+    "fig2_3": True, "figS1_S4": False, "fig4_5": False, "figSX": False,
     "fig6": False, "fig7": False, "fig8_9": False, "figS5": False,
-    "figS6": False, "fig10": True, "table_s1": False, "tables_s2_s9": False,
+    "figS6": False, "fig10": False, "table_1": False, "tables_s1_s8": False,
 }
 
 STOP_ON_ERROR = False
 USE_DASK = False
+
+# --- table output format ---
+# one of: "pdf", "docx", "both"  (applies to table_1 and tables_s1_s8)
+TABLE_FORMAT = "pdf"
+
+# --- equal-area analysis grid ---
+# Source rasters are EPSG:4326, where cell ground area falls off with cos(lat),
+# so a raw pixel count over-weights high latitudes. Every quantity the paper
+# reports is therefore computed after warping onto this shared equal-area grid,
+# which makes a pixel share an area share: stats.py (all console statistics),
+# figures.fig10 (-> unprotected_loss_stats.csv -> Tables S1-S8), figures.fig4_5
+# (Figs 4/5 densities) and figures.fig8_9 (the sample behind the Spearman
+# matrix, Fig 8's panels and Fig 9's colour cut-points). Maps are NOT warped -
+# cartopy renders them area-honestly from the native grid.
+#
+# Any equal-area CRS gives the same percentages; this one is the NSIDC EASE-Grid
+# 2.0 Global standard. Prefer a *cylindrical* equal-area CRS: pseudocylindrical
+# ones (e.g. Equal Earth, EPSG:8857) keep out-of-domain corners in their
+# bounding rectangle, and stats.py will warn if the land area disagrees.
+# Set EQUAL_AREA_CRS = None to count on the native EPSG:4326 grid instead.
+EQUAL_AREA_CRS = "EPSG:6933"
+EQUAL_AREA_RES = 1000            # metres, in EQUAL_AREA_CRS units
+# "nearest" keeps the HM value distribution intact, so only the area weighting
+# changes. Averaging/bilinear would smooth values across the 0.10/0.40 cuts.
+EQUAL_AREA_RESAMPLING = "nearest"
 
 # --- input paths (logical name -> file) ---
 PATHS = {
@@ -50,10 +75,16 @@ PATHS = {
     "pred_2010_upper": DATA_DIR / "prediction_2010_upper_blended.tif",
     "pred_2015_upper": DATA_DIR / "prediction_2015_upper_blended.tif",
     "pred_2020_upper": DATA_DIR / "prediction_2020_upper_blended.tif",
+    "pred_2025_upper": DATA_DIR / "prediction_2025_upper_blended.tif",
+    "pred_2030_upper": DATA_DIR / "prediction_2030_upper_blended.tif",
+    "pred_2035_upper": DATA_DIR / "prediction_2035_upper_blended.tif",
     "pred_2005_lower": DATA_DIR / "prediction_2005_lower_blended.tif",
     "pred_2010_lower": DATA_DIR / "prediction_2010_lower_blended.tif",
     "pred_2015_lower": DATA_DIR / "prediction_2015_lower_blended.tif",
     "pred_2020_lower": DATA_DIR / "prediction_2020_lower_blended.tif",
+    "pred_2025_lower": DATA_DIR / "prediction_2025_lower_blended.tif",
+    "pred_2030_lower": DATA_DIR / "prediction_2030_lower_blended.tif",
+    "pred_2035_lower": DATA_DIR / "prediction_2035_lower_blended.tif",
     "covariates_xlsx": DATA_DIR / "Supplementary_Table_S2_covariates.xlsx",
 }
 # NOTE: fig10 / S5 / S6 reference further inputs (PA raster, ecoregions, 2040

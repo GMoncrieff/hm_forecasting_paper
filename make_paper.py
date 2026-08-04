@@ -5,7 +5,7 @@ Edit config.RUN to choose outputs, then run:
     mamba run -n hm_plots python make_paper.py
 
 Outputs land in config.OUTPUT_DIR (default: ./output). Figure 10 is ordered
-before Tables S2-S9 because the tables consume its unprotected_loss_stats.csv.
+before Tables S1-S8 because the tables consume its unprotected_loss_stats.csv.
 """
 import time
 import traceback
@@ -14,7 +14,7 @@ import config
 import figures
 import tables
 
-# (name, callable) in dependency order; fig10 must precede tables_s2_s9.
+# (name, callable) in dependency order; fig10 must precede tables_s1_s8.
 ORDERED_OUTPUTS = [
     ("fig2_3", figures.fig2_3),
     ("figS1_S4", figures.figS1_S4),
@@ -26,8 +26,8 @@ ORDERED_OUTPUTS = [
     ("figS5", figures.figS5),
     ("figS6", figures.figS6),
     ("fig10", figures.fig10),
-    ("table_s1", tables.table_s1),
-    ("tables_s2_s9", tables.tables_s2_s9),
+    ("table_1", tables.table_1),
+    ("tables_s1_s8", tables.tables_s1_s8),
 ]
 
 
