@@ -79,6 +79,55 @@ def test_warp_reweights_a_latitude_band(latitude_band):
     assert share < 25.0 - 3.0     # clearly moved off the pixel-count answer
 
 
+def test_warp_preserves_the_declared_nodata(tmp_path, monkeypatch):
+    """A raster that *contains* its declared nodata must keep it masked.
+
+    Regression: open_equal_area passed src_nodata=None explicitly, which tells
+    GDAL the source has no nodata and overrides what the file declares. The HM
+    rasters declare +3.4e38, so ocean came back as valid data and the land mask
+    became the entire grid. Every earlier fixture either skipped the warp or
+    held no nodata cells, so nothing caught it.
+    """
+    monkeypatch.setattr(config, 'EQUAL_AREA_CRS', 'EPSG:6933')
+    monkeypatch.setattr(config, 'EQUAL_AREA_RES', 25_000)
+    arr = np.full((120, 360), float(ND), dtype=np.float32)
+    arr[40:80, :] = 0.5                      # a valid band amid declared nodata
+    path = tmp_path / 'holes.tif'
+    _write(path, arr)
+
+    with rasterio.open(path) as ref:
+        grid = utils.equal_area_grid(ref)
+    with contextlib.ExitStack() as stack:
+        vrt = utils.open_equal_area(stack, path, grid)
+        assert vrt.src_nodata == pytest.approx(float(ND)), \
+            'the source nodata was overridden'
+        out = utils.read_masked(vrt)
+
+    finite = np.isfinite(out)
+    assert not np.any(out > 1.0), '3.4e38 leaked through as data'
+    assert 0.05 < finite.mean() < 0.95, \
+        f'expected a partial mask, got {finite.mean():.1%} valid'
+    assert np.allclose(out[finite], 0.5)
+
+
+def test_explicit_src_nodata_still_overrides(tmp_path, monkeypatch):
+    """Passing src_nodata must still win for files that misstate or omit it."""
+    monkeypatch.setattr(config, 'EQUAL_AREA_CRS', 'EPSG:6933')
+    monkeypatch.setattr(config, 'EQUAL_AREA_RES', 25_000)
+    arr = np.full((120, 360), 7.0, dtype=np.float32)
+    arr[40:80, :] = 0.5
+    path = tmp_path / 'wrong_nodata.tif'
+    _write(path, arr, nodata=None)           # file declares nothing
+
+    with rasterio.open(path) as ref:
+        grid = utils.equal_area_grid(ref)
+    with contextlib.ExitStack() as stack:
+        vrt = utils.open_equal_area(stack, path, grid, src_nodata=7.0)
+        out = utils.read_masked(vrt)
+    assert not np.any(out == 7.0), 'explicit src_nodata was ignored'
+    assert np.allclose(out[np.isfinite(out)], 0.5)
+
+
 def test_integer_raster_without_fill_is_refused(tmp_path, monkeypatch):
     """A NaN fill on uint8 promotes the VRT to float64; make callers choose."""
     monkeypatch.setattr(config, 'EQUAL_AREA_CRS', 'EPSG:6933')

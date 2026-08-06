@@ -240,11 +240,26 @@ def report(res: dict) -> None:
         print(' equal-area cells, so a pixel share is also an area share')
         if abs(area_ratio(res)) > AREA_TOLERANCE_PCT:
             print()
+            over = area_ratio(res) > 0
             print(f' !! WARNING: the two land areas disagree by more than '
-                  f'{AREA_TOLERANCE_PCT}%.')
-            print(f' !! {res["crs"]} is likely filling destination cells that lie')
-            print(f' !! outside its valid domain, which corrupts every percentage')
-            print(f' !! below. Prefer a cylindrical equal-area CRS (EPSG:6933).')
+                  f'{AREA_TOLERANCE_PCT}%. Every')
+            print(f' !! percentage below is computed on a land mask that is '
+                  f'{"too large" if over else "too small"},')
+            print(f' !! so treat them all as wrong until this is resolved. '
+                  f'Likely causes:')
+            print(f' !!   1. nodata is not being honoured, so ocean counts as '
+                  f'land. Check')
+            print(f' !!      that the warp preserves each source\'s declared '
+                  f'nodata - passing')
+            print(f' !!      src_nodata=None to WarpedVRT *overrides* it rather '
+                  f'than')
+            print(f' !!      inheriting it, which turns +3.4e38 into valid data.')
+            print(f' !!   2. {res["crs"]} fills destination cells outside its '
+                  f'valid domain.')
+            print(f' !!      Pseudocylindrical CRSs (e.g. Equal Earth, '
+                  f'EPSG:8857) keep')
+            print(f' !!      out-of-domain corners; a cylindrical one such as '
+                  f'EPSG:6933 does not.')
     else:
         print(f' grid           EPSG:4326 (native, NOT equal area)')
         print(f'                {height:,} x {width:,}  ({cells:,} cells)')

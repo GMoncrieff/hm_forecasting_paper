@@ -81,11 +81,16 @@ def open_equal_area(stack, path, grid, *, src_nodata=None, fill=None):
                 'rasters, and the polar gap then reads as a real class value.')
         fill = float('nan')
 
+    # Passing src_nodata=None EXPLICITLY is not the same as omitting it: it
+    # tells GDAL the source has no nodata, overriding the value the file
+    # declares. The HM rasters declare +3.4e38, so that silently turned ocean
+    # into valid data and the land mask became the whole grid.
+    override = {} if src_nodata is None else {'src_nodata': src_nodata}
     return stack.enter_context(WarpedVRT(
         src, crs=config.EQUAL_AREA_CRS, transform=transform,
         width=width, height=height,
         resampling=getattr(Resampling, config.EQUAL_AREA_RESAMPLING),
-        src_nodata=src_nodata, nodata=fill,
+        nodata=fill, **override,
     ))
 
 
