@@ -6,7 +6,9 @@ Run:
 
 Prints three blocks of percentages:
 
-  * direction of HM change - observed 2000-2020 against projected 2020-2040
+  * direction of HM change - observed 2000-2020 against projected 2020-2040,
+    at each threshold in CHANGE_THRESHOLDS, since where the "no meaningful
+    change" line is drawn moves the increase/decrease split a long way
   * share of low-HM (< 0.10) land in 2020 that reaches HM >= 0.10 by 2025-2040
   * share of moderate-HM (0.10-0.40) land in 2020 that reaches HM >= 0.40
 
@@ -37,7 +39,12 @@ import equal_area
 
 # --- parameters -------------------------------------------------------------
 
-CHANGE_THRESHOLD = 0.005   # |dHM| at or below this counts as stable
+# |dHM| at or below a threshold counts as stable. The change block is reported
+# at each of these, so the reader can see how sensitive the increase/decrease
+# split is to where the "no meaningful change" line is drawn.
+CHANGE_THRESHOLDS = (0.005, 0.01, 0.05)
+CHANGE_THRESHOLD = CHANGE_THRESHOLDS[0]   # the headline one
+
 LOW_CUT = 0.10             # "low HM" ceiling / first exceedance level
 HIGH_CUT = 0.40            # "moderate HM" ceiling / second exceedance level
 
@@ -112,7 +119,8 @@ def collect() -> dict:
     if missing:
         raise SystemExit('Missing input rasters:\n  ' + '\n  '.join(missing))
 
-    change = {c: dict(increase=0, decrease=0, stable=0, n=0)
+    change = {c: {t: dict(increase=0, decrease=0, stable=0, n=0)
+                  for t in CHANGE_THRESHOLDS}
               for c in ('projected', 'observed')}
     low = {sc_yr: dict(base=0, crossed=0) for sc_yr in keys if sc_yr not in
            ('obs2000', 'obs2020')}
@@ -150,13 +158,14 @@ def collect() -> dict:
 
             # Observed change 2000-2020.
             both = fin2000 & fin2020
+            n_both = int(np.count_nonzero(both))
             with np.errstate(invalid='ignore'):
                 delta = obs2020 - obs2000
-                change['observed']['increase'] += int(np.count_nonzero(
-                    both & (delta > CHANGE_THRESHOLD)))
-                change['observed']['decrease'] += int(np.count_nonzero(
-                    both & (delta < -CHANGE_THRESHOLD)))
-            change['observed']['n'] += int(np.count_nonzero(both))
+                for t in CHANGE_THRESHOLDS:
+                    row = change['observed'][t]
+                    row['increase'] += int(np.count_nonzero(both & (delta > t)))
+                    row['decrease'] += int(np.count_nonzero(both & (delta < -t)))
+                    row['n'] += n_both
 
             for sc_yr in low:
                 pred = read_strip(src[sc_yr], window)
@@ -177,17 +186,22 @@ def collect() -> dict:
                     # Projected change 2020-2040 uses the central 2040 forecast.
                     if sc_yr == ('central', 2040):
                         ok = fin2020 & fin
+                        n_ok = int(np.count_nonzero(ok))
                         delta = pred - obs2020
-                        change['projected']['increase'] += int(np.count_nonzero(
-                            ok & (delta > CHANGE_THRESHOLD)))
-                        change['projected']['decrease'] += int(np.count_nonzero(
-                            ok & (delta < -CHANGE_THRESHOLD)))
-                        change['projected']['n'] += int(np.count_nonzero(ok))
+                        for t in CHANGE_THRESHOLDS:
+                            row = change['projected'][t]
+                            row['increase'] += int(np.count_nonzero(
+                                ok & (delta > t)))
+                            row['decrease'] += int(np.count_nonzero(
+                                ok & (delta < -t)))
+                            row['n'] += n_ok
 
         print('\r' + ' ' * 70 + '\r', end='', file=sys.stderr, flush=True)
 
-    for row in change.values():
-        row['stable'] = row['n'] - row['increase'] - row['decrease']
+    # stable is derived, so the three always sum to n by construction
+    for by_threshold in change.values():
+        for row in by_threshold.values():
+            row['stable'] = row['n'] - row['increase'] - row['decrease']
 
     native_km2 = source_land_area_km2()
     warped_km2 = (valid_2020 * config.EQUAL_AREA_RES ** 2 / 1e6
@@ -269,15 +283,21 @@ def report(res: dict) -> None:
     print()
 
     # --- change direction ---
-    print(f'OBSERVED VS PROJECTED CHANGE   (stable = |dHM| <= {CHANGE_THRESHOLD})')
+    print('OBSERVED VS PROJECTED CHANGE   (stable = |dHM| <= threshold)')
     print(rule())
-    print(f'  {"":<34}{"increase":>10}{"decrease":>10}{"stable":>10}{"n pixels":>14}')
-    for label, key in ((f'Projected 2020-2040 (central)', 'projected'),
-                       (f'Observed  2000-2020', 'observed')):
-        row = res['change'][key]
-        print(f'  {label:<34}{pct(row["increase"], row["n"]):>10}'
-              f'{pct(row["decrease"], row["n"]):>10}'
-              f'{pct(row["stable"], row["n"]):>10}{row["n"]:>14,}')
+    print(f'  {"":<32}{"threshold":>11}{"increase":>10}'
+          f'{"decrease":>10}{"stable":>10}')
+    for label, key in (('Projected 2020-2040 (central)', 'projected'),
+                       ('Observed  2000-2020', 'observed')):
+        by_threshold = res['change'][key]
+        for i, t in enumerate(sorted(by_threshold)):
+            row = by_threshold[t]
+            print(f'  {label if i == 0 else "":<32}{t:>11.3f}'
+                  f'{pct(row["increase"], row["n"]):>10}'
+                  f'{pct(row["decrease"], row["n"]):>10}'
+                  f'{pct(row["stable"], row["n"]):>10}')
+    ns = {k: next(iter(v.values()))["n"] for k, v in res['change'].items()}
+    print(f'  n = {ns["projected"]:,} (projected) · {ns["observed"]:,} (observed)')
     print()
 
     # --- exceedance blocks ---

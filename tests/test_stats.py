@@ -99,10 +99,11 @@ def reference(arrays):
 
     both = f2000 & f2020
     d = np.where(both, obs2020 - obs2000, 0.0)
-    out['change']['observed'] = dict(
-        increase=int((both & (d > stats.CHANGE_THRESHOLD)).sum()),
-        decrease=int((both & (d < -stats.CHANGE_THRESHOLD)).sum()),
-        n=int(both.sum()))
+    out['change']['observed'] = {
+        t: dict(increase=int((both & (d > t)).sum()),
+                decrease=int((both & (d < -t)).sum()),
+                n=int(both.sum()))
+        for t in stats.CHANGE_THRESHOLDS}
 
     for scenario in stats.SCENARIOS:
         for year in stats.FORECAST_YEARS:
@@ -118,10 +119,11 @@ def reference(arrays):
             if (scenario, year) == ('central', 2040):
                 ok = f2020 & fin
                 d = np.where(ok, pred - obs2020, 0.0)
-                out['change']['projected'] = dict(
-                    increase=int((ok & (d > stats.CHANGE_THRESHOLD)).sum()),
-                    decrease=int((ok & (d < -stats.CHANGE_THRESHOLD)).sum()),
-                    n=int(ok.sum()))
+                out['change']['projected'] = {
+                    t: dict(increase=int((ok & (d > t)).sum()),
+                            decrease=int((ok & (d < -t)).sum()),
+                            n=int(ok.sum()))
+                    for t in stats.CHANGE_THRESHOLDS}
     return out
 
 
@@ -129,11 +131,36 @@ def test_hand_computed_change(fixture_rasters):
     res = stats.collect()
     assert res['valid_2020'] == 13
 
-    obs = res['change']['observed']
+    t = stats.CHANGE_THRESHOLD          # 0.005, the headline threshold
+    obs = res['change']['observed'][t]
     assert (obs['n'], obs['increase'], obs['decrease'], obs['stable']) == (13, 4, 2, 7)
 
-    proj = res['change']['projected']
+    proj = res['change']['projected'][t]
     assert (proj['n'], proj['increase'], proj['decrease'], proj['stable']) == (13, 4, 0, 9)
+
+
+def test_every_threshold_is_reported(fixture_rasters):
+    res = stats.collect()
+    for key in ('observed', 'projected'):
+        assert set(res['change'][key]) == set(stats.CHANGE_THRESHOLDS), key
+
+
+def test_raising_the_threshold_moves_pixels_into_stable(fixture_rasters):
+    """A wider stable band can only shrink increase/decrease, never grow them.
+
+    Exact counts at 0.01 are not asserted: the fixture's +/-0.01 deltas land on
+    the cut in float32, so which side they fall is not a property worth pinning.
+    """
+    res = stats.collect()
+    for key in ('observed', 'projected'):
+        by_threshold = res['change'][key]
+        rows = [by_threshold[t] for t in sorted(by_threshold)]
+        for lo, hi in zip(rows, rows[1:]):
+            assert hi['increase'] <= lo['increase'], key
+            assert hi['decrease'] <= lo['decrease'], key
+            assert hi['stable'] >= lo['stable'], key
+        for row in rows:
+            assert row['increase'] + row['decrease'] + row['stable'] == row['n']
 
 
 def test_hand_computed_exceedance(fixture_rasters):
@@ -157,11 +184,14 @@ def test_matches_reference_at_every_strip_height(
     ref = reference(fixture_rasters)
 
     assert res['valid_2020'] == ref['valid_2020']
-    for key, expected in ref['change'].items():
-        got = res['change'][key]
-        assert (got['increase'], got['decrease'], got['n']) == (
-            expected['increase'], expected['decrease'], expected['n']), key
-        assert got['stable'] == expected['n'] - expected['increase'] - expected['decrease']
+    for key, by_threshold in ref['change'].items():
+        for t, expected in by_threshold.items():
+            got = res['change'][key][t]
+            assert (got['increase'], got['decrease'], got['n']) == (
+                expected['increase'], expected['decrease'],
+                expected['n']), (key, t)
+            assert got['stable'] == (expected['n'] - expected['increase']
+                                     - expected['decrease'])
     for block in ('low', 'mid'):
         assert res[block] == ref[block], block
 
@@ -211,11 +241,11 @@ def test_equal_area_reweights_by_latitude(tmp_path, monkeypatch):
     _latitude_band_rasters(tmp_path, monkeypatch, res_m=25_000)
 
     monkeypatch.setattr(config, 'EQUAL_AREA_CRS', None)
-    native = stats.collect()['change']['observed']
+    native = stats.collect()['change']['observed'][stats.CHANGE_THRESHOLD]
     native_pct = 100.0 * native['increase'] / native['n']
 
     monkeypatch.setattr(config, 'EQUAL_AREA_CRS', 'EPSG:6933')
-    equal = stats.collect()['change']['observed']
+    equal = stats.collect()['change']['observed'][stats.CHANGE_THRESHOLD]
     equal_pct = 100.0 * equal['increase'] / equal['n']
 
     expected = 100.0 * (np.sin(np.deg2rad(60)) - np.sin(np.deg2rad(30))) / (
@@ -233,7 +263,7 @@ def test_equal_area_result_is_projection_independent(tmp_path, monkeypatch, crs)
     _latitude_band_rasters(tmp_path, monkeypatch, res_m=25_000)
     monkeypatch.setattr(config, 'EQUAL_AREA_CRS', crs)
     res = stats.collect()
-    row = res['change']['observed']
+    row = res['change']['observed'][stats.CHANGE_THRESHOLD]
     assert 100.0 * row['increase'] / row['n'] == pytest.approx(21.13, abs=0.6)
     assert abs(stats.area_ratio(res)) < stats.AREA_TOLERANCE_PCT
 
