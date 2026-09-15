@@ -1,4 +1,5 @@
 output/
+output_new/
 output_old/
 data/
 __pycache__/

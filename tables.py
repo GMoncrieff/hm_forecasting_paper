@@ -4,6 +4,7 @@ Each table is rendered as a reportlab PDF, a python-docx DOCX, or both,
 according to config.TABLE_FORMAT. The two renderers consume the same loaded
 data; only the layout code differs.
 """
+import re
 from xml.sax.saxutils import escape
 
 import pandas as pd
@@ -310,8 +311,44 @@ def table_1():
         return s
 
 
+    def tidy(df: pd.DataFrame) -> pd.DataFrame:
+        """Two wording fixes applied at read time, not at source.
+
+        "Derived in-model from X" -> "Derived from X": how a covariate is
+        computed inside the model is an implementation detail the reader of a
+        covariate table does not need, and it appears in one workbook row as
+        well as in config.EXTRA_COVARIATES.
+
+        "... at radii 3, 30, 100 px (3 channels)" -> "... at radii 3, 30,
+        100 px": the channel count restates the radius list and is about the
+        tensor layout rather than the covariate.
+
+        These run here rather than in the xlsx because data/ is regenerated
+        wholesale from the model repo, so an edit there is lost on the next
+        refresh. They are no-ops on the config rows, which already read this
+        way.
+        """
+        df = df.copy()
+        if 'Source dataset' in df.columns:
+            df['Source dataset'] = df['Source dataset'].astype('object').apply(
+                lambda v: v if pd.isna(v)
+                else str(v).replace('Derived in-model from', 'Derived from'))
+        if 'Covariate' in df.columns:
+            df['Covariate'] = df['Covariate'].astype('object').apply(
+                lambda v: v if pd.isna(v)
+                else re.sub(r'\s*\(\d+\s+channels?\)', '', str(v)))
+        return df
+
+
     def load() -> tuple[str, pd.DataFrame, str]:
-        """Return (description, data-with-Type, notes) parsed from the workbook."""
+        """Return (description, data-with-Type, notes) parsed from the workbook.
+
+        The workbook is the source for everything it contains, but the
+        distributional model added long-range context channels that postdate
+        it. Those rows live in config.EXTRA_COVARIATES and are appended here
+        rather than edited into the xlsx, because data/ is regenerated wholesale
+        from the model repo and an edit there would be lost on the next refresh.
+        """
         raw = pd.read_excel(XLSX, header=None)
         col0 = raw.iloc[:, 0].astype('string')
         hdr = col0.eq('Covariate').idxmax()                 # header row index
@@ -322,7 +359,17 @@ def table_1():
         df = raw.iloc[hdr + 1:notes_idx].copy()
         df.columns = raw.iloc[hdr].tolist()
         df = df.dropna(how='all').reset_index(drop=True)
-        return description, df, notes
+
+        extra = getattr(config, 'EXTRA_COVARIATES', None)
+        if extra:
+            missing = [c for c in df.columns
+                       if c not in extra[0] and str(c) != 'nan']
+            if missing:
+                raise SystemExit(
+                    f'config.EXTRA_COVARIATES is missing workbook columns: '
+                    f'{missing}. Add them, or the appended rows render blank.')
+            df = pd.concat([df, pd.DataFrame(extra)], ignore_index=True)
+        return description, tidy(df), notes
 
 
     def build_table(df: pd.DataFrame) -> Table:
@@ -451,70 +498,87 @@ def table_1():
 
 
 def tables_s1_s8():
-    """Supplementary Tables S1-S8: per-realm ecoregion composition -> PDF/DOCX.
+    """Supplementary Tables S1-S8: per-realm expected loss -> PDF/DOCX.
 
     One table per realm in REALM_ORDER, so Afrotropic is S1 and Palearctic S8.
 
-    Depends on fig10's unprotected_loss_stats.csv; computes it (via fig10) if absent.
+    What changed. These used to report, for each ecoregion, the proportion of
+    land that was protected, still natural and lost by 2040, each under an
+    "upper" and a "central" scenario. Those two columns were the 97.5th and the
+    mean of every pixel's own distribution, thresholded and counted - so the
+    "upper" column was the area lost only if every pixel realised its unlucky
+    outcome simultaneously, not an upper bound on a forecast.
+
+    They now report EXPECTED AREA: the sum over pixels of each pixel's
+    probability of crossing a threshold, times cell area. Two blocks of four
+    years each - natural lands lost (HM crossing 0.10 on land at or below it
+    in 2020) and moderately modified lands lost (crossing 0.40 on land between
+    the cuts). Every area is km2, including the ecoregion total beside the name;
+    they were hectares, which ran a whole-ecoregion total to nine digits.
+
+    Depends on fig10's realm_loss_stats.csv; computes it (via fig10) if absent.
     """
     FORMATS = _formats()   # validate before a missing stats CSV triggers fig10
 
     OUT = config.OUTPUT_DIR
     OUT.mkdir(parents=True, exist_ok=True)
-    STATS_CSV = OUT / 'unprotected_loss_stats.csv'
+    STATS_CSV = OUT / 'realm_loss_stats.csv'
     OUT_DIR = OUT / 'realm_tables'
     TABLES_DIR = OUT_DIR
     OUT_PDF = OUT / 'realm_tables.pdf'
     OUT_DOCX = OUT / 'realm_tables.docx'
-    DOC_TITLE = 'Per-realm ecoregion composition tables'
+    DOC_TITLE = 'Per-realm ecoregion expected-loss tables'
     if not STATS_CSV.exists():
         import figures
         figures.fig10()
 
-    COLUMN_MAP = {
-        'BIOME_NAME': 'Biome',
-        'ECO_NAME': 'Ecoregion',
-        'pct_protected': 'Protected',
-        'pct_grey_upper': 'Still Natural 2040 (upper)',
-        'pct_grey_central': 'Still Natural 2040 (central)',
-        'pct_lost_upper': 'Natural lands loss 2040 (upper)',
-        'pct_lost_central': 'Natural Lands loss 2040 (central)',
-        'pct_unprot_nonnatural_2020': 'Non-natural 2020',
-    }
+    YEARS = list(config.FORECAST_YEARS)
 
-    PROPORTION_COLS = [
-        'Protected',
-        'Still Natural 2040 (upper)',
-        'Still Natural 2040 (central)',
-        'Natural lands loss 2040 (upper)',
-        'Natural Lands loss 2040 (central)',
-        'Non-natural 2020',
-    ]
+    # source column -> display column. The two blocks are distinguished by the
+    # spanning header rather than by the column titles, which are just years.
+    #
+    # Total area sits between the name and the loss columns, so every expected
+    # loss can be read against the ecoregion it came out of - a 50,000 ha loss
+    # means something different in a 60,000 ha ecoregion than in a 6 M ha one.
+    # Everything in the table is km2, so the totals and the losses can be read
+    # against each other directly.
+    AREA_COL = 'Total area (km2)'
+    COLUMN_MAP = {'BIOME_NAME': 'Biome', 'ECO_NAME': 'Ecoregion',
+                  'eco_area_km2': AREA_COL}
+    for stem, group in (('natural_lost', 'Natural'),
+                        ('midmod_lost', 'Moderately modified')):
+        for y in YEARS:
+            COLUMN_MAP[f'{stem}_{y}_km2'] = f'{group} {y}'
+
+    VALUE_COLS = [f'{g} {y}' for g in ('Natural', 'Moderately modified')
+                  for y in YEARS]
+    # Everything printed with the thousands-separated integer format.
+    NUMERIC_COLS = [AREA_COL] + VALUE_COLS
 
 
     def _export_main() -> None:
         if not STATS_CSV.exists():
             raise SystemExit(
                 f"Stats CSV not found: {STATS_CSV}\n"
-                "Run plot_unprotected_loss.py first to generate it."
+                "Run figures.fig10() first to generate it."
             )
 
         OUT_DIR.mkdir(parents=True, exist_ok=True)
-        print(f"Reading {STATS_CSV.name}…")
+        print(f"Reading {STATS_CSV.name}...")
         stats = pd.read_csv(STATS_CSV)
 
         missing = [c for c in COLUMN_MAP if c not in stats.columns]
         if missing:
             raise SystemExit(
                 f"Stats CSV is missing required columns: {missing}\n"
-                "Re-run plot_unprotected_loss.py to regenerate with the latest schema."
+                "Re-run figures.fig10() to regenerate with the latest schema."
             )
 
         print(f"  {len(stats)} ecoregions across {stats['REALM'].nunique()} realms")
 
         for realm, group in stats.groupby('REALM'):
             out = group[list(COLUMN_MAP.keys())].rename(columns=COLUMN_MAP).copy()
-            out[PROPORTION_COLS] = (out[PROPORTION_COLS] / 100.0).round(4)
+            out[NUMERIC_COLS] = out[NUMERIC_COLS].round(0)
             out = out.sort_values(['Biome', 'Ecoregion']).reset_index(drop=True)
 
             fname = f"{realm.replace(' ', '_').replace('/', '_')}.csv"
@@ -540,63 +604,55 @@ def tables_s1_s8():
         'Palearctic':  'Palearctic',
     }
 
-    # The protected mask is hm_static_iucn_strict_1000.tif — IUCN categories I–IV
-    # are the conventional "strict" set. Adjust the label if your raster differs.
-    IUCN_TEXT = 'IUCN categories I–IV'
+    FONT_SIZE = 9.5
 
-    DECIMALS = 3
-
-    # Column widths in inches; shared by both renderers.
-    COL_WIDTHS = [
-        3.10,  # Ecoregion (long names wrap)
-        0.80,  # Protected
-        0.95,  # Still Natural upper
-        0.95,  # Still Natural central
-        1.10,  # Natural loss upper (group label needs ~2.2in across cols 4-5)
-        1.10,  # Natural loss central
-        1.30,  # Non-natural 2020
-    ]
+    # Column widths in inches; shared by both renderers. Landscape letter with
+    # 0.5in margins leaves 10.0in. The name column gives up 0.25in and the year
+    # columns 0.10in each to pay for the area column.
+    COL_WIDTHS = [2.15, 0.85] + [0.875] * 8
 
     # Two-row header:
-    # Row 0 — grouped labels only (over cols 2-3 and 4-5), other cols empty.
-    # Row 1 — actual column titles for every column.
-    # This keeps the underline below the grouped labels well above the
-    # single-row column titles, so nothing is bisected by a line.
-    HEADER_TOP = ['', '',
-                  'Still Natural 2040', '',
-                  'Natural lands loss 2040', '',
-                  '']
-    HEADER_BOTTOM = ['Ecoregion', 'Protected',
-                     'upper', 'central',
-                     'upper', 'central',
-                     'Non-natural 2020']
+    # Row 0 - the two spanning group labels, each underlined only across its
+    #         own columns, so nothing is bisected by a line. The first two
+    #         columns are outside both groups.
+    # Row 1 - the years.
+    HEADER_TOP = ['', '', 'Natural lands lost (km2)', '', '', '',
+                  'Moderately modified lands lost (km2)', '', '', '']
+    HEADER_BOTTOM = ['Ecoregion', AREA_COL] + [str(y) for y in YEARS] * 2
 
-    # PROPORTION_COLS is already in the order HEADER_BOTTOM names them, so it
-    # doubles as the value-column order for both renderers.
-    VALUE_COLS = PROPORTION_COLS
+    # (first, last) column index of each spanning group in HEADER_TOP
+    GROUP_SPANS = ((2, 5), (6, 9))
 
 
     def caption_parts(table_num: int, realm: str) -> tuple[str, str]:
-        """(bold label, body) — one caption source for both renderers.
+        """(bold label, body) - one caption source for both renderers.
 
-        The denominator is stated explicitly: the old wording ("proportion of
-        {realm} ecoregions formally protected") read as a count of ecoregions
-        rather than a share of each ecoregion's area, and said nothing about
-        the grid the share was measured on.
+        The caption has to say "expected" out loud. These numbers are not the
+        area of any one future; they are the sum of per-pixel probabilities, so
+        they are valid whatever the spatial dependence between pixels turns out
+        to be, and they are not comparable with the scenario columns this table
+        used to carry.
         """
         grid_note = (
-            f" Proportions are of ground area, measured on a "
+            f" Areas are measured on a "
             f"{config.EQUAL_AREA_RES // 1000} km equal-area grid "
             f"({config.EQUAL_AREA_CRS})."
         ) if config.EQUAL_AREA_CRS else ''
         return (
-            # table_num counts from 1, and the realm tables now start at S1
-            # (the covariates table moved to the main text as Table 1).
             f"Table S{table_num}.",
-            f" Proportion of each {REALM_ADJECTIVE[realm]} ecoregion's land "
-            f"area formally protected ({IUCN_TEXT}) in 2020, and the projected "
-            f"2040 status of unprotected land under the upper and central "
-            f"scenarios.{grid_note}"
+            f" Expected area of each {REALM_ADJECTIVE[realm]} ecoregion "
+            f"projected to cross a human-modification threshold, in square "
+            f"kilometres. "
+            f"Natural lands lost is the expected area of land at or below "
+            f"HM {config.LOW_CUT:g} in 2020 that reaches HM "
+            f"{config.LOW_CUT:g}; moderately modified lands lost is the "
+            f"expected area of land above HM {config.LOW_CUT:g} and below "
+            f"HM {config.HIGH_CUT:g} in 2020 that reaches HM "
+            f"{config.HIGH_CUT:g}. Each is the sum over pixels of that pixel's "
+            f"probability of crossing the threshold, so it is an expectation "
+            f"rather than the area under any single scenario, and is valid "
+            f"under any spatial dependence between pixels. Total area is the "
+            f"ecoregion's whole land area.{grid_note}"
         )
 
 
@@ -606,11 +662,15 @@ def tables_s1_s8():
 
 
     def fmt(x: float) -> str:
-        return f"{x:.{DECIMALS}f}"
+        """Square kilometres, to the nearest whole one, thousands-separated."""
+        if pd.isna(x):
+            return '-'
+        return f"{x:,.0f}"
 
 
     ECO_STYLE = ParagraphStyle(
-        'eco_cell', fontName='Times-Roman', fontSize=12, leading=14,
+        'eco_cell', fontName='Times-Roman', fontSize=FONT_SIZE,
+        leading=FONT_SIZE + 2,
     )
 
 
@@ -621,11 +681,6 @@ def tables_s1_s8():
         rows = [list(HEADER_TOP), list(HEADER_BOTTOM)]
 
         style_cmds: list = [
-            # Grouped header spans + underlines (only over the grouped cells)
-            ('SPAN',      (2, 0), (3, 0)),
-            ('SPAN',      (4, 0), (5, 0)),
-            ('LINEBELOW', (2, 0), (3, 0), 0.5, colors.black),
-            ('LINEBELOW', (4, 0), (5, 0), 0.5, colors.black),
             # Outer header rules
             ('LINEABOVE', (0, 0), (-1, 0), 1.0, colors.black),
             ('LINEBELOW', (0, 1), (-1, 1), 1.0, colors.black),
@@ -633,27 +688,34 @@ def tables_s1_s8():
             ('FONTNAME', (0, 0), (-1, 1), 'Times-Bold'),
             ('FONTNAME', (0, 2), (-1, -1), 'Times-Roman'),
             # Sizes / alignment
-            ('FONTSIZE', (0, 0), (-1, -1), 12),
-            ('LEADING',  (0, 0), (-1, -1), 14),
+            ('FONTSIZE', (0, 0), (-1, -1), FONT_SIZE),
+            ('LEADING',  (0, 0), (-1, -1), FONT_SIZE + 2),
             ('VALIGN',   (0, 0), (-1, -1), 'MIDDLE'),
             ('ALIGN',    (0, 0), (0, -1), 'LEFT'),
-            ('ALIGN',    (1, 0), (-1, -1), 'CENTER'),
+            ('ALIGN',    (1, 0), (-1, -1), 'RIGHT'),
+            ('ALIGN',    (1, 0), (-1, 1), 'CENTER'),
             # Padding
-            ('LEFTPADDING',   (0, 0), (-1, -1), 4),
-            ('RIGHTPADDING',  (0, 0), (-1, -1), 4),
+            ('LEFTPADDING',   (0, 0), (-1, -1), 3),
+            ('RIGHTPADDING',  (0, 0), (-1, -1), 3),
             ('TOPPADDING',    (0, 0), (-1, -1), 3),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
         ]
+        # Grouped header spans + underlines (only over the grouped cells)
+        for lo, hi in GROUP_SPANS:
+            style_cmds += [
+                ('SPAN',      (lo, 0), (hi, 0)),
+                ('LINEBELOW', (lo, 0), (hi, 0), 0.5, colors.black),
+            ]
 
         biome_row_indices = []
         for biome_name, biome_grp in df.groupby('Biome', sort=False):
-            rows.append([biome_name, '', '', '', '', '', ''])
+            rows.append([biome_name] + [''] * (len(HEADER_BOTTOM) - 1))
             biome_row_indices.append(len(rows) - 1)
             for _, r in biome_grp.iterrows():
                 rows.append(
                     # Paragraph wraps long ecoregion names
                     [Paragraph(r['Ecoregion'], ECO_STYLE)]
-                    + [fmt(r[c]) for c in VALUE_COLS]
+                    + [fmt(r[c]) for c in NUMERIC_COLS]
                 )
 
         # Bold biome subheading rows that span the whole table.
@@ -684,32 +746,33 @@ def tables_s1_s8():
         for row in (top, bottom):
             _repeat_header(row)
 
-        # Row 0 — outer top rule across everything, then the two grouped labels,
+        # Row 0 - outer top rule across everything, then the two grouped labels,
         # each underlined only across the columns it spans.
         for cell in top.cells:
             _rule(cell, 'top')
-        for lo, hi in ((2, 3), (4, 5)):
+        for lo, hi in GROUP_SPANS:
             merged = top.cells[lo].merge(top.cells[hi])
             merged.text = ''
-            _fill(merged, HEADER_TOP[lo], bold=True, size=12,
+            _fill(merged, HEADER_TOP[lo], bold=True, size=FONT_SIZE,
                   align='center', valign='middle')
             _rule(merged, 'bottom', RULE_LIGHT)
 
-        # Row 1 — column titles, closed by the heavy rule under the header block.
+        # Row 1 - column titles, closed by the heavy rule under the header block.
         for j, (cell, title) in enumerate(zip(bottom.cells, HEADER_BOTTOM)):
-            _fill(cell, title, bold=True, size=12,
+            _fill(cell, title, bold=True, size=FONT_SIZE,
                   align='left' if j == 0 else 'center', valign='middle')
             _rule(cell, 'bottom')
 
         last = bottom
         for biome_name, biome_grp in df.groupby('Biome', sort=False):
-            _merge_across(_add_row(table, COL_WIDTHS), biome_name, size=12)
+            _merge_across(_add_row(table, COL_WIDTHS), biome_name, size=FONT_SIZE)
             for _, r in biome_grp.iterrows():
                 last = _add_row(table, COL_WIDTHS)
-                _fill(last.cells[0], r['Ecoregion'], size=12, valign='middle')
-                for j, col in enumerate(VALUE_COLS, start=1):
-                    _fill(last.cells[j], fmt(r[col]), size=12,
-                          align='center', valign='middle')
+                _fill(last.cells[0], r['Ecoregion'], size=FONT_SIZE,
+                      valign='middle')
+                for j, col in enumerate(NUMERIC_COLS, start=1):
+                    _fill(last.cells[j], fmt(r[col]), size=FONT_SIZE,
+                          align='right', valign='middle')
 
         for cell in last.cells:
             _rule(cell, 'bottom')
@@ -740,8 +803,8 @@ def tables_s1_s8():
             caption = doc.add_paragraph()
             caption.paragraph_format.space_after = Pt(8)
             label, body = caption_parts(table_num, realm)
-            _write(caption, label, bold=True, size=12)
-            _write(caption, body, size=12, strip=False)
+            _write(caption, label, bold=True, size=11)
+            _write(caption, body, size=11, strip=False)
 
             build_docx_table(doc, df)
             print(f"  Table {table_num}: {realm} ({len(df)} ecoregions)")
@@ -761,14 +824,14 @@ def tables_s1_s8():
             rightMargin=0.5 * inch,
             topMargin=0.5 * inch,
             bottomMargin=0.5 * inch,
-            title='Per-realm ecoregion composition tables',
+            title=DOC_TITLE,
         )
 
         caption_style = ParagraphStyle(
             'caption',
             fontName='Times-Roman',
-            fontSize=12,
-            leading=15,
+            fontSize=10.5,
+            leading=13,
             spaceAfter=8,
         )
 

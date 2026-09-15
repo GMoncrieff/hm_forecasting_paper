@@ -14,6 +14,7 @@ import numpy as np
 import xarray as xr
 import rioxarray as rxr
 import rasterio
+from rasterio.warp import transform_bounds
 from sklearn.preprocessing import QuantileTransformer
 from scipy.stats import beta
 
@@ -225,6 +226,29 @@ def register_coolwarm_cmap():
         plt.colormaps.register(name='my_custom_coolwarm', cmap=custom_cmap_obj)
 
 
+def exceedance_cmap_norm():
+    """(cmap, norm) for the exceedance-probability maps (Figs 3, 6, S6).
+
+    A BoundaryNorm on uneven breaks, not a linear Normalize. Most land has a
+    small probability of crossing a threshold, so a linear scale puts nearly
+    every pixel in the first colour and the 0.01-0.2 range - where the signal
+    actually lives - collapses to one shade.
+    """
+    cmap = mcolors.ListedColormap(config.P_EXCEED_COLORS)
+    # Transparent, NOT ocean. pcolormesh RENDERS nodata cells with the bad
+    # colour rather than skipping them, so an opaque bad value is a layer drawn
+    # on top of everything beneath it. Here NaN means "already above the
+    # threshold in the base year", and painting that ocean-blue covered the
+    # out-of-base land underlay completely - zero beige pixels survived in a
+    # 6008x2840 render. Leaving it transparent lets the z-order do the work:
+    # axes facecolor is ocean, the underlay is out-of-base land, the mesh is
+    # probability. Callers that draw no underlay (Fig 6's imshow panels) set
+    # their own bad colour.
+    cmap.set_bad(alpha=0.0)
+    norm = mcolors.BoundaryNorm(config.P_EXCEED_LEVELS, cmap.N)
+    return cmap, norm
+
+
 def register_class_cmap():
     """Register the 5-class 'raster_classes' colormap (idempotent)."""
     custom_cmap = ListedColormap(config.CLASS_COLORS)
@@ -296,21 +320,67 @@ def build_global_robinson_map(pds, *, cmap, clim, cbar_label, hide_geo_spine=Fal
     return fig, ax
 
 
-def add_circular_insets(fig, ax, pds, *, cmap, vmin, vmax):
-    """Add the 3 circular zoom insets used by Figs 2 and S1-S4.
+def add_circular_insets(fig, ax, pds, *, cmap, vmin=None, vmax=None, norm=None,
+                        under=None):
+    """Add the 3 circular zoom insets used by Figs 2, 3 and S1-S4.
 
-    ``cmap`` is the registered colormap name; NaNs render as ocean. ``pds`` is
-    the same DataArray plotted in the main map.
+    ``cmap`` is a registered colormap name or a Colormap; NaNs render as ocean.
+    ``pds`` is the same DataArray plotted in the main map.
+
+    Pass ``norm`` instead of ``vmin``/``vmax`` for a non-linear scale - the
+    probability maps use a BoundaryNorm, which has no meaningful vmin/vmax.
+    ``under`` is an optional second DataArray drawn beneath the data as a flat
+    colour, which is how Fig 3 shows land that is outside its base: three
+    distinct states (ocean, out-of-base land, probability) instead of two.
+
+    The inset is sized off the *main map axes*, in inches, not off the figure.
+    config.INSET_SIZE used to be a figure fraction, which only produced the
+    intended 0.34 in circle on the 4x4 in canvas hv.render() returns for Fig 2;
+    on the hand-built 13.9 x 7.6 in canvas of Figs 3a/3b the same fraction gave
+    a 1.18 x 0.65 in box - both far too large and elliptical, since the circular
+    border is drawn in axes-fraction space and inherits the box's aspect.
+    Measuring against the map instead reproduces Fig 2 exactly and makes every
+    other map match it whatever its canvas.
     """
     robinson = ccrs.Robinson()
     platecarree = ccrs.PlateCarree()
 
-    inset_cmap = plt.cm.get_cmap(cmap).copy()
-    inset_cmap.set_bad(config.OCEAN_HEX)
+    inset_cmap = (plt.get_cmap(cmap) if isinstance(cmap, str) else cmap).copy()
+    if under is None:
+        # No underlay, so nodata IS ocean and painting it is right (Figs 2,
+        # S1-S4). With an underlay it is not: pcolormesh renders nodata with the
+        # bad colour, which would cover the out-of-base land drawn beneath and
+        # put the inset back to two states while the main map shows three.
+        inset_cmap.set_bad(config.OCEAN_HEX)
+    mesh_kw = {'norm': norm} if norm is not None else {'vmin': vmin, 'vmax': vmax}
 
     inset_defs = config.INSET_DEFS
     radius_deg = config.RADIUS_DEG
-    inset_size = config.INSET_SIZE
+
+    # One diameter in inches, then back to a per-axis figure fraction, so the
+    # box is square on the page (a circle, not an ellipse) on any canvas.
+    #
+    # Draw first: a GeoAxes keeps aspect with adjustable='box', so its position
+    # is only final once it has been laid out. Measuring before that would size
+    # the insets off a box matplotlib is about to shrink - and the anchor
+    # transform below reads the same stale layout.
+    fig.canvas.draw()
+    fig_w_in, fig_h_in = fig.get_size_inches()
+    map_w_in = ax.get_position().width * fig_w_in
+    inset_in = config.INSET_MAP_FRAC * map_w_in
+    w_frac, h_frac = inset_in / fig_w_in, inset_in / fig_h_in
+
+    # Strokes are in POINTS, which is an absolute size - so the same linewidth
+    # on a map three times wider draws three times thinner once both figures are
+    # scaled to one page width. That is why Fig 3's locator rings and inset
+    # borders came out as hairlines beside Fig 2's. Scaling every point-valued
+    # size by the map's width against Fig 2's reproduces Fig 2 exactly (scale 1)
+    # and matches it everywhere else.
+    scale = map_w_in / config.INSET_REF_MAP_W_IN
+    border_lw = config.INSET_BORDER_LW * scale
+    spine_lw = config.INSET_SPINE_LW * scale
+    marker_size = config.INSET_MARKER_SIZE * scale
+    marker_lw = config.INSET_MARKER_LW * scale
 
     for ins in inset_defs:
         clat, clon = ins['center']
@@ -321,7 +391,7 @@ def add_circular_insets(fig, ax, pds, *, cmap, vmin, vmax):
         fx, fy = fig.transFigure.inverted().transform(disp)
 
         ax_ins = fig.add_axes(
-            [fx - inset_size / 2, fy - inset_size / 2, inset_size, inset_size],
+            [fx - w_frac / 2, fy - h_frac / 2, w_frac, h_frac],
             projection=platecarree
         )
         ax_ins.set_facecolor(config.OCEAN_HEX)
@@ -330,15 +400,24 @@ def add_circular_insets(fig, ax, pds, *, cmap, vmin, vmax):
             crs=platecarree
         )
 
-        sub = pds.sel(
+        window = dict(
             x=slice(clon - radius_deg - 0.1, clon + radius_deg + 0.1),
-            y=slice(clat + radius_deg + 0.1, clat - radius_deg - 0.1)
+            y=slice(clat + radius_deg + 0.1, clat - radius_deg - 0.1),
         )
+        sub = pds.sel(**window)
+
+        if under is not None:
+            # Flat land colour first, so the probability layer's NaNs read as
+            # "outside the base" rather than as ocean.
+            u = under.sel(**window)
+            ax_ins.pcolormesh(
+                u.x.values, u.y.values, np.where(np.asarray(u.values), 1.0, np.nan),
+                cmap=mcolors.ListedColormap([config.OUT_OF_BASE_HEX]),
+                vmin=0.0, vmax=1.0, transform=platecarree, shading='auto')
 
         ax_ins.pcolormesh(
             sub.x.values, sub.y.values, sub.values,
-            cmap=inset_cmap, vmin=vmin, vmax=vmax,
-            transform=platecarree, shading='auto'
+            cmap=inset_cmap, transform=platecarree, shading='auto', **mesh_kw
         )
 
         theta = np.linspace(0, 2 * np.pi, 200)
@@ -351,7 +430,8 @@ def add_circular_insets(fig, ax, pds, *, cmap, vmin, vmax):
         ax_ins.set_boundary(circle_path, transform=platecarree)
 
         border = Circle((0.5, 0.5), 0.5, transform=ax_ins.transAxes,
-                        facecolor='none', edgecolor='black', linewidth=0.3, zorder=6)
+                        facecolor='none', edgecolor='black',
+                        linewidth=border_lw, zorder=6)
         ax_ins.add_patch(border)
 
         ax_ins.set_xticks([])
@@ -361,12 +441,114 @@ def add_circular_insets(fig, ax, pds, *, cmap, vmin, vmax):
 
         ax.spines['geo'].set_visible(True)
         ax.spines['geo'].set_edgecolor('black')
-        ax.spines['geo'].set_linewidth(0.3)
+        ax.spines['geo'].set_linewidth(spine_lw)
 
         x_loc, y_loc = robinson.transform_point(clon, clat, platecarree)
-        ax.plot(x_loc, y_loc, 'o', color='black', markersize=4,
-                markerfacecolor='none', markeredgewidth=0.4,
+        ax.plot(x_loc, y_loc, 'o', color='black', markersize=marker_size,
+                markerfacecolor='none', markeredgewidth=marker_lw,
                 transform=ax.transData, zorder=10)
+
+
+def plot_quantile_fan_legend(out_path, gamma=config.FAN_GAMMA,
+                             alpha_min=config.FAN_ALPHA_MIN,
+                             alpha_max=config.FAN_ALPHA_MAX,
+                             color=config.FAN_COLOR,
+                             intervals=(0.5, 0.8, 0.99),
+                             p_range=None, orientation='vertical',
+                             title=None, facecolor='white', n=512,
+                             figsize=None, fontsize=None, bar_frac=None):
+    """Standalone legend for the continuous quantile fan used by Figure 7.
+
+    The alpha mapping below has to stay identical to the one the fan itself
+    uses: alpha = alpha_min + (alpha_max - alpha_min) * w ** gamma, with
+    w = 1 - 2|F - 0.5|. If the two drift apart the legend stops describing the
+    figure, and nothing would flag it.
+
+    ``bar_frac`` is the colour bar's thickness as a fraction of the figure's
+    short side, and ``fontsize`` sets the title and the tick labels; both
+    default to config. The bar used to be laid out by plt.subplots, so it filled
+    the axes and came out as a wide slab with small type beside it. It carries
+    no quantitative information across its thickness - only along it - so the
+    thickness is wasted ink, and the labels are the part a reader actually uses.
+
+    Ported from output/timeseries.py.
+    """
+    if fontsize is None:
+        fontsize = config.FAN_LEGEND_FONTSIZE
+    if bar_frac is None:
+        bar_frac = config.FAN_LEGEND_BAR_FRAC
+    lo, hi = p_range if p_range is not None else (0.0, 1.0)
+    coord = np.linspace(lo, hi, n)
+    w = 1.0 - 2.0 * np.abs(coord - 0.5)      # 1 at median, -> 0 in tails
+
+    ticks, labels = [], []
+    for c in sorted(intervals):
+        for b in ((1.0 - c) / 2.0, (1.0 + c) / 2.0):
+            if lo <= b <= hi:
+                ticks.append(b)
+                labels.append(f'{c:.0%}')
+    if lo <= 0.5 <= hi:
+        ticks.append(0.5)
+        labels.append('median')
+    if title is None:
+        title = 'Prediction interval'
+
+    a = alpha_min + (alpha_max - alpha_min) * np.clip(w, 0.0, 1.0) ** gamma
+
+    if figsize is None:
+        figsize = (1.9, 3.0) if orientation == 'vertical' else (4.6, 1.5)
+    fig = plt.figure(figsize=figsize)
+
+    # Place the bar explicitly rather than letting a subplot fill the canvas:
+    # bar_frac is its thickness, and the rest of the short side is left to the
+    # labels. tight_layout is not used with add_axes (it would undo this);
+    # bbox_inches='tight' at save time trims whatever slack is left over.
+    if orientation == 'vertical':
+        rect = [0.04, 0.03, bar_frac, 0.87]
+    else:
+        rect = [0.04, 1.0 - bar_frac - 0.30, 0.90, bar_frac]
+    ax = fig.add_axes(rect)
+
+    rgb = mcolors.to_rgb(color)
+    strip = np.zeros((n, 8, 4))
+    strip[..., :3] = rgb
+    strip[..., 3] = a[:, None]
+
+    if orientation == 'vertical':
+        img, extent = strip, [0.0, 1.0, lo, hi]
+    else:
+        img, extent = np.transpose(strip, (1, 0, 2)), [lo, hi, 0.0, 1.0]
+
+    ax.set_facecolor(facecolor)
+    ax.imshow(img, extent=extent, origin='lower', aspect='auto',
+              interpolation='bilinear')
+
+    tick_fs = fontsize
+    if orientation == 'vertical':
+        ax.set_ylim(lo, hi)
+        ax.set_xticks([])
+        ax.set_yticks(ticks)
+        ax.set_yticklabels(labels)
+        ax.yaxis.tick_right()
+        ax.tick_params(axis='y', length=3, labelsize=tick_fs, pad=3)
+        ax.set_title(title, fontsize=fontsize, pad=8, loc='left')
+    else:
+        ax.set_xlim(lo, hi)
+        ax.set_yticks([])
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(labels)
+        ax.tick_params(axis='x', length=3, labelsize=tick_fs, pad=3)
+        ax.set_xlabel(title, fontsize=fontsize)
+
+    for side in ('left', 'right', 'top', 'bottom'):
+        ax.spines[side].set_visible(False)
+
+    ax.patch.set_edgecolor('0.7')
+    ax.patch.set_linewidth(0.8)
+
+    fig.savefig(str(out_path), dpi=config.DPI_PLOT, bbox_inches='tight')
+    plt.close(fig)
+    return out_path
 
 
 def plot_ternary_alpha_legend(out_path,
@@ -410,15 +592,9 @@ def plot_ternary_alpha_legend(out_path,
     ax.text(-0.06, -0.05, labels[0], color=tuple(colors[0]), ha='right', va='top', **lab)
     ax.text(0.5, h + 0.06, labels[1], color=tuple(colors[1]), ha='center', va='bottom', **lab)
     ax.text(1.06, -0.05, labels[2], color=tuple(colors[2]), ha='left', va='top', **lab)
-    centre = np.array([0.5, h / 3.0])
-    corners = [np.array([0.0, 0.0]), np.array([0.5, h]), np.array([1.0, 0.0])]
-    for s, e in [(corners[0], corners[1]), (corners[1], corners[2]), (corners[2], corners[0])]:
-        for f in (0.25, 0.50, 0.75):
-            pt = s + f * (e - s)
-            d = pt - centre
-            d = d / np.linalg.norm(d)
-            tx, ty = pt + 0.04 * d
-            ax.text(tx, ty, f"{int(f * 100)}", fontsize=9, ha='center', va='center')
+    # The sides used to carry 25/50/75 tick labels. The triangle encodes which
+    # of the three layers dominates, not a readable mixing ratio, so the numbers
+    # invited a precision the hue binning does not support.
     ax.set_xlim(-0.22, 1.22)
     ax.set_ylim(-0.18, h + 0.22)
     ax.set_aspect('equal')
@@ -479,6 +655,67 @@ open_equal_area = equal_area.open_equal_area
 read_masked = equal_area.read_masked
 
 
+def align_like(da, ref, *, tol=1e-6):
+    """Snap `da` onto `ref`'s x/y coordinates when the two describe one grid.
+
+    The probability COGs were written by a different tool than the HM rasters.
+    Both declare the identical transform and shape, but the two toolchains
+    build the coordinate arrays with slightly different floating-point
+    arithmetic - a max difference of ~1e-11 degrees, roughly a micrometre.
+
+    xarray aligns binary operations on coordinate *equality*, not proximity, so
+    `p.where(hm < 0.1)` inner-joins 40,000 longitudes down to the 42 that match
+    bit-for-bit and returns a 21x42 array. No warning is raised and the result
+    is a map of 882 pixels, which is why this is a hard failure below rather
+    than something to fix at each call site.
+
+    Only the native-grid path needs this. Anything read through
+    `open_equal_area` is warped onto one explicitly-constructed grid and is
+    immune by construction.
+    """
+    if da.shape != ref.shape:
+        raise ValueError(f'cannot align {da.shape} onto {ref.shape}: '
+                         'different grids, not a floating-point difference')
+    for dim in ('x', 'y'):
+        drift = float(np.abs(da[dim].values - ref[dim].values).max())
+        if drift > tol:
+            raise ValueError(
+                f'{dim} coordinates differ by {drift:g} > {tol:g}; these are '
+                'genuinely different grids, so snapping them would be wrong')
+    return da.assign_coords({'x': ref['x'], 'y': ref['y']})
+
+
+def trim_wrapped_columns(x_coords, *arrays):
+    """Drop the equal-area grid's antimeridian-straddling edge columns.
+
+    `equal_area_grid` snaps the destination bounds outward to whole cells, so
+    for EPSG:6933 the grid is ~470 m wider than the projection's valid domain
+    at each side and the first and last columns straddle +/-180 degrees.
+    Cartopy draws a quad that crosses the antimeridian as a polygon spanning
+    the entire map, which puts a horizontal stripe across the figure at every
+    latitude with land near the date line - most visibly around 72 N, where
+    Chukotka and Wrangel Island sit.
+
+    This is a display problem only. Those columns hold 748 of 131.4 M land
+    cells (0.0006%), so trimming them here rather than reshaping the analysis
+    grid keeps every reported number exactly as computed.
+
+    Returns (x_coords, *arrays) with the offending columns removed from the
+    last axis of each.
+    """
+    x = np.asarray(x_coords)
+    if x.size < 3 or not config.EQUAL_AREA_CRS:
+        return (x, *arrays)
+    left, _, right, _ = transform_bounds(
+        'EPSG:4326', config.EQUAL_AREA_CRS, -180.0, -1e-6, 180.0, 1e-6)
+    limit = max(abs(left), abs(right))
+    half = abs(float(x[1] - x[0])) / 2.0
+    keep = np.abs(x) + half <= limit
+    if keep.all():
+        return (x, *arrays)
+    return (x[keep], *[np.asarray(a)[..., keep] for a in arrays])
+
+
 def open_equal_area_da(stack, path, grid, *, chunks=None, **kwargs):
     """`open_equal_area` as an xarray DataArray, for the rioxarray call sites.
 
@@ -501,10 +738,37 @@ def open_equal_area_da(stack, path, grid, *, chunks=None, **kwargs):
 # preserves the ocean mask through the subtraction (ocean stays NaN, not 0).
 # ---------------------------------------------------------------------------
 def load_hm_diff(chunks='auto'):
-    """HM change 2040-2020 = central 2040 forecast - observed 2020 (live)."""
+    """Expected HM change 2040-2020 = E[HM 2040] - observed 2020 (live).
+
+    The blended "central" surface is E[Q] = the integral of Q(u) over [0,1] -
+    the mean of the predictive distribution, not its median - so this is an
+    expected change. Figures 2, S5 and 8/9 all read it through here.
+    """
     central = rxr.open_rasterio(config.PATHS['hm_central_2040'], chunks=chunks, masked=True)
     obs2020 = rxr.open_rasterio(config.PATHS['hm_2020_aa'], chunks=chunks, masked=True)
     return central - obs2020
+
+
+def load_hm_diff_bound(bound, chunks='auto'):
+    """HM change 2040-2020 from a distribution *bound* rather than its mean.
+
+    ``bound`` is 'lower' or 'upper': the 2.5th and 97.5th percentile of each
+    pixel's own predictive distribution. Figures S5 and S6 show these beside
+    Figure 2's expected change, so a reader can see the width of the forecast
+    on the same colour scale.
+
+    These are per-pixel percentiles, not scenarios. A map of the upper bound is
+    the change realised only if every pixel lands on its unlucky outcome at the
+    same time - the perfect-dependence extreme - which is why nothing in this
+    repo sums or thresholds them. See the README.
+    """
+    if bound not in ('lower', 'upper'):
+        raise ValueError(f"bound must be 'lower' or 'upper', got {bound!r}")
+    b = rxr.open_rasterio(config.PATHS[f'hm_{bound}_2040'], chunks=chunks,
+                          masked=True)
+    obs2020 = rxr.open_rasterio(config.PATHS['hm_2020_aa'], chunks=chunks,
+                                masked=True)
+    return b - obs2020
 
 
 def load_hm_diff_obs(chunks='auto'):

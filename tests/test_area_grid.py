@@ -224,3 +224,51 @@ def test_ternary_without_fit_values_warns_it_is_not_area_fair(capsys):
     ds = xr.Dataset({k: (('y', 'x'), base.copy()) for k in ('a', 'b', 'c')})
     utils.create_ternary_alpha_array(ds, 'a', 'b', 'c')
     assert 'NOT area-fair' in capsys.readouterr().out
+
+
+# --- antimeridian trim ------------------------------------------------------
+#
+# equal_area_grid snaps outward to whole cells, so the grid is slightly wider
+# than the projection's valid domain and its edge columns straddle +/-180.
+# Cartopy draws such a quad across the whole map, which put a stripe through
+# Figure 10 at every latitude with land near the date line.
+
+
+def test_trim_drops_exactly_one_column_at_each_edge():
+    import rasterio
+    with rasterio.open(config.PATHS['hm_static_iucn_strict']) as ref:
+        transform, width, _ = utils.equal_area_grid(ref)
+    for stride in (1, 4, 8):
+        x = transform.c + transform.a * stride * (np.arange(width // stride) + 0.5)
+        data = np.zeros((3, x.size))
+        x2, d2 = utils.trim_wrapped_columns(x, data)
+        assert x.size - x2.size == 2, stride
+        assert d2.shape == (3, x2.size)
+        assert np.array_equal(x2, x[1:-1])
+
+
+def test_trim_keeps_a_grid_that_is_already_inside_the_domain():
+    """A grid comfortably inside the valid x range must not lose anything."""
+    x = np.linspace(-1e6, 1e6, 50)
+    data = np.zeros((2, 50))
+    x2, d2 = utils.trim_wrapped_columns(x, data)
+    assert np.array_equal(x2, x)
+    assert d2.shape == data.shape
+
+
+def test_trim_is_a_no_op_without_an_equal_area_crs(monkeypatch):
+    monkeypatch.setattr(config, 'EQUAL_AREA_CRS', None)
+    x = np.linspace(-2e7, 2e7, 10)
+    data = np.zeros((1, 10))
+    x2, d2 = utils.trim_wrapped_columns(x, data)
+    assert np.array_equal(x2, x) and d2.shape == data.shape
+
+
+def test_trim_handles_several_arrays_and_leading_axes():
+    x = np.array([-17366000.0, -17362000.0, 0.0, 17362000.0, 17366000.0])
+    a = np.arange(2 * 3 * 5).reshape(2, 3, 5)
+    b = np.ones((5,), dtype=bool)
+    x2, a2, b2 = utils.trim_wrapped_columns(x, a, b)
+    assert x2.size == 3
+    assert a2.shape == (2, 3, 3)
+    assert b2.shape == (3,)

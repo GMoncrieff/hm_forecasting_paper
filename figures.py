@@ -12,6 +12,7 @@ computed after warping onto config.EQUAL_AREA_CRS, where one cell is one
 constant patch of ground. Maps are deliberately left on the native grid, since
 cartopy already renders them area-honestly.
 """
+import contextlib
 from pathlib import Path
 import numpy as np
 import xarray as xr
@@ -29,6 +30,7 @@ import hvplot.xarray  # noqa: F401  (registers .hvplot accessor)
 import holoviews as hv
 
 import config
+import quantiles
 import utils
 from utils import (fetch_esri_satellite, fmt_coord,
                    transform_xarray_layer, create_ternary_alpha_array)
@@ -36,11 +38,126 @@ from utils import (fetch_esri_satellite, fmt_coord,
 OUT = config.OUTPUT_DIR
 
 
+def _load_exceedance(year, level, *, base_year=2020, chunks='auto'):
+    """P(HM >= level) for `year`, masked to the pixels the base admits.
+
+    Returns (probability, base, land) as native-grid DataArrays. `base` is the
+    condition class in `base_year` that the probability is about - natural for
+    the 0.10 level, moderately modified for 0.40 - and `land` is everything
+    with an observed value. Keeping the three separate is what lets the maps
+    show ocean, out-of-base land and probability as three distinct states
+    rather than folding the middle one into the first.
+
+    Both cuts are closed at the bottom (natural is HM <= 0.10), so the two
+    bases stay disjoint and together with "already >= 0.40" they partition the
+    land. See config.LOW_CUT.
+    """
+    key = 'hm_p10' if level == config.LOW_CUT else 'hm_p40'
+    p = rxr.open_rasterio(config.PATHS[f'{key}_{year}'], chunks=chunks,
+                          masked=True).squeeze(drop=True)
+    hm = rxr.open_rasterio(config.PATHS[f'hm_{base_year}_aa'], chunks=chunks,
+                           masked=True).squeeze(drop=True)
+    # Same grid, coordinates built by a different tool - see utils.align_like.
+    # Without this the masking below silently inner-joins to a few hundred cells.
+    p = utils.align_like(p, hm)
+    land = hm.notnull()
+    if level == config.LOW_CUT:
+        base = land & (hm <= config.LOW_CUT)
+    else:
+        base = land & (hm > config.LOW_CUT) & (hm < config.HIGH_CUT)
+    return p.where(base), base, land
+
+
+def _exceedance_display(p_base, land, stride):
+    """Coarsen a probability field and its land mask for display.
+
+    The probability is averaged, not sub-sampled. At this stride one displayed
+    cell covers stride^2 source cells, and the mean probability over a block is
+    the expected fraction of it that crosses the threshold - the same quantity
+    the rest of the paper reports. Taking the maximum would show the worst
+    pixel in every block and inflate the map; striding would drop isolated hot
+    pixels entirely.
+    """
+    kw = dict(x=stride, y=stride, boundary='trim')
+    disp = p_base.coarsen(**kw).mean(skipna=True).compute()
+    land_c = land.coarsen(**kw).max().compute()
+    return disp, land_c
+
+
+def _exceedance_colorbar(fig, ax, mesh, label, *, shrink=0.42, pad=0.02,
+                         orientation='vertical', fontsize=9):
+    """Discrete colorbar for the exceedance scale, ticked on the breaks."""
+    cbar = fig.colorbar(mesh, ax=ax, orientation=orientation, shrink=shrink,
+                        pad=pad, ticks=config.P_EXCEED_LEVELS,
+                        spacing='uniform')
+    cbar.set_label(label, fontsize=fontsize)
+    labels = [f'{t:g}' for t in config.P_EXCEED_LEVELS]
+    if orientation == 'vertical':
+        cbar.ax.set_yticklabels(labels)
+    else:
+        cbar.ax.set_xticklabels(labels)
+    cbar.ax.tick_params(labelsize=max(6, fontsize - 2), width=0.3, length=2)
+    cbar.outline.set_linewidth(0.3)
+    return cbar
+
+
+def _exceedance_map(disp, land_c, *, cbar_label, out_path,
+                    p_full=None, land_full=None):
+    """Global Robinson map of an exceedance probability, with the Fig 2 insets."""
+    cmap, norm = utils.exceedance_cmap_norm()
+
+    fig = plt.figure(figsize=(13.9, 7.6))
+    ax = plt.axes(projection=ccrs.Robinson())
+    ax.set_global()
+    ax.set_facecolor(config.OCEAN_HEX)
+
+    # Land first, as one flat colour, so a NaN in the probability layer reads
+    # as "already above the threshold in the base year", not as ocean.
+    ax.pcolormesh(
+        land_c.x.values, land_c.y.values,
+        np.where(np.asarray(land_c.values), 1.0, np.nan),
+        cmap=mcolors.ListedColormap([config.OUT_OF_BASE_HEX]),
+        vmin=0.0, vmax=1.0, transform=ccrs.PlateCarree(),
+        shading='auto', rasterized=True, zorder=1,
+    )
+    mesh = ax.pcolormesh(
+        disp.x.values, disp.y.values, disp.values,
+        cmap=cmap, norm=norm, transform=ccrs.PlateCarree(),
+        shading='auto', rasterized=True, zorder=2,
+    )
+
+    ax.spines['geo'].set_visible(True)
+    ax.spines['geo'].set_edgecolor('black')
+    ax.spines['geo'].set_linewidth(0.3)
+    ax.set_title('')
+
+    _exceedance_colorbar(fig, ax, mesh, cbar_label)
+
+    if p_full is not None:
+        utils.add_circular_insets(fig, ax, p_full, cmap=cmap, norm=norm,
+                                  under=land_full)
+
+    fig.savefig(out_path, dpi=config.DPI_MAP, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  saved {out_path.name}')
+
+
 def fig2_3():
+    """Fig 2 (expected HM change 2020-2040) and Figs 3a/3b (exceedance maps).
+
+    Figure 3 used to be a five-class categorical map built from the lower /
+    central / upper triple, which encoded a scenario rather than a probability.
+    It is now two maps of what the model actually estimates: for land natural in
+    2020, the probability it reaches HM >= 0.10 by 2040; and for land that is
+    moderately modified, the probability it reaches HM >= 0.40.
+    data/raster_classes.tif is no longer read by anything.
+    """
     OUT.mkdir(parents=True, exist_ok=True)
     utils.register_coolwarm_cmap()
 
     # ---- Figure 2 (shared global-map builder) ----
+    # The "central" surface is E[Q] = the mean of the predictive distribution,
+    # so this difference is an expected change, not a median scenario.
     ds = utils.load_hm_diff()
     ds = ds.to_dataset(name="hm")
     ds = ds.drop('band')
@@ -52,254 +169,36 @@ def fig2_3():
 
     fig, ax = utils.build_global_robinson_map(
         pds, cmap='my_custom_coolwarm', clim=config.CLIM,
-        cbar_label='HM change 2020-2040')
+        cbar_label='Expected HM change 2020-2040')
     utils.add_circular_insets(fig, ax, pds, cmap='my_custom_coolwarm',
                               vmin=config.CLIM[0], vmax=config.CLIM[1])
     fig.savefig(OUT / 'fig2_hmdiff_map.png', dpi=config.DPI_MAP, bbox_inches='tight')
+    plt.close(fig)
+    del ds, pds
 
-    # ---- Figure 3 (verbatim categorical map; kept separate per design) ----
-    # NOTE: the original notebook's trailing GeoTIFF re-export of raster_classes.tif
-    # is dropped here: it was broken (Dataset-in-Dataset) and redundant with the
-    # data/raster_classes.tif input. The two figures are unaffected.
-    #load data
+    # ---- Figures 3a / 3b: exceedance probabilities in 2040 ----
+    year = config.FORECAST_YEARS[-1]
+    stride = 8                     # same decimation the categorical map used
 
-    upp = rxr.open_rasterio(config.PATHS['hm_upper_2040'], chunks='auto')
-    low = rxr.open_rasterio(config.PATHS['hm_lower_2040'], chunks='auto')
-    mid = rxr.open_rasterio(config.PATHS['hm_central_2040'], chunks='auto')
-    hm = rxr.open_rasterio(config.PATHS['hm_observed_2020'], chunks='auto')
-
-    ds = xr.Dataset({
-        "upper": upp,
-        "lower": low,
-        "central": mid,
-        "hm": hm,
-    })
-    ds = ds.drop_vars("band")
-    ds = ds.squeeze()
-    ds
-
-    #convert to  0 or 1 using threshold of 0.1
-    ds_binary = ds.where(ds > 0.1, 1)
-    ds_binary = ds_binary.where(ds_binary <= 0.1, 0)
-    ds_binary
-
-    # Create a raster with 5 classes based on the conditions
-    raster = xr.zeros_like(ds['hm'])
-
-    # 0 when 'hm' is 1
-    raster = raster.where(ds_binary['hm'] != 1, 0)
-
-    # 1 when 'hm' is 0 and 'upper' is 0
-    mask_1 = (ds_binary['hm'] == 0) & (ds_binary['upper'] == 0)
-    raster = raster.where(~mask_1, 1)
-
-    # 2 when 'hm' is 0 and 'upper' is 1
-    mask_2 = (ds_binary['hm'] == 0) & (ds_binary['upper'] == 1)
-    raster = raster.where(~mask_2, 2)
-
-    # 3 when 'hm' is 0 and 'central' is 1
-    mask_3 = (ds_binary['hm'] == 0) & (ds_binary['central'] == 1)
-    raster = raster.where(~mask_3, 3)
-
-    # 4 when 'hm' is 0 and 'lower' is 1
-    mask_4 = (ds_binary['hm'] == 0) & (ds_binary['lower'] == 1)
-    raster = raster.where(~mask_4, 4)
-
-    #set values of ds['hm'] > 1 to na
-    mask_5 = (ds['hm'] > 1)
-    raster = raster.where(~mask_5, np.nan)
-
-    mask = xr.where(ds['hm'].notnull(), 0, 10)
-    raster = raster + mask
-    #raster = raster.where(raster >= 0)
-
-    #raster.to_zarr('output_ras.zarr', mode='w')
-    #raster = xr.open_zarr('output_ras.zarr')
-
-    #read raster from data/raster_classes.tif
-    raster = rxr.open_rasterio(config.PATHS['raster_classes'])
-
-    #drop band dimension
-    raster = raster.squeeze()
-    #conver to ds with var hm
-    raster = raster.to_dataset(name="hm")
-    raster
-
-    raster = raster.where(~ds['upper'].isnull())
-
-    # ------------------------------------------------------------------
-    # Figure 3
-    # ------------------------------------------------------------------
-    #create and export fig2 plot
-
-    # Create and register the same 5-class colormap currently used for Figure 2
-    colors = ['#000000', '#bee6c2', '#ffbb00', '#ff0000', '#dd87ff']
-    custom_cmap = ListedColormap(colors)
-
-    try:
-        plt.colormaps.register(name='raster_classes', cmap=custom_cmap)
-    except ValueError:
-        plt.colormaps.unregister('raster_classes')
-        plt.colormaps.register(name='raster_classes', cmap=custom_cmap)
-
-    # Normalize to a 2D DataArray (works whether raster is DataArray or Dataset)
-    if isinstance(raster, xr.Dataset):
-        if 'hm' in raster.data_vars:
-            raster_da = raster['hm']
-        else:
-            raster_da = raster[next(iter(raster.data_vars))]
-    else:
-        raster_da = raster
-
-    # Keep only classes 0-4 for plotting (everything else -> NaN/ocean)
-    raster_plot_data = raster_da.where((raster_da >= 0) & (raster_da <= 4))
-
-    # Downsample main map for stability while keeping Figure 1 layout
-    main_plot_data = raster_plot_data.isel(x=slice(None, None, 8), y=slice(None, None, 8)).compute()
-
-    # Build main map with Figure 1 plotting/layout settings
-    hv.extension('matplotlib')
-    plot = main_plot_data.hvplot.quadmesh(
-        x='x', y='y',
-        frame_width=1000,
-        frame_height=700,
-        pixel_ratio=6,
-        xlabel='Longitude',
-        ylabel='Latitude',
-        projection=ccrs.Robinson(),
-        global_extent=True,
-        cmap='raster_classes'
-    ).opts(
-        clim=(0, 4)
-    )
-
-    fig = hv.render(plot, backend='matplotlib')
-    ax = fig.axes[0]
-
-    # Match Figure 1 map border and background styling
-    ax.set_facecolor('#F4FCFF')
-    ax.spines['geo'].set_visible(True)
-    ax.spines['geo'].set_edgecolor('black')
-    ax.spines['geo'].set_linewidth(0.3)
-    ax.set_title('')
-
-    # Match Figure 1 legend size/location, keep categorical text labels
-    legend_labels = [
-        'Non-natural 2020',
-        'Still Natural 2040',
-        'Natural lands loss 2040 (upper 97.5% forecast)',
-        'Natural lands loss 2040 (central 50% forecasts)',
-        'Natural lands loss 2040 (lower 2.5% forecast)'
-    ]
-
-    for a in fig.axes[1:]:
-        pos = a.get_position()
-        a.set_position([pos.x0, pos.y0 + pos.height * 0.25, pos.width * 0.4, pos.height * 0.3])
-        a.tick_params(labelsize=3, width=0.0, length=0)
-        for spine in a.spines.values():
-            spine.set_linewidth(0.3)
-        a.set_yticks([0, 1, 2, 3, 4])
-        a.set_yticklabels(legend_labels)
-        a.set_ylabel('')
-
-    # Reuse Figure 1 inset layout/locations
-    robinson = ccrs.Robinson()
-    platecarree = ccrs.PlateCarree()
-
-    inset_cmap = plt.colormaps['raster_classes'].copy()
-    inset_cmap.set_bad('#F4FCFF')
-
-    inset_defs = [
-        {'center': (-3.046461, -49.938504), 'anchor': (-30, -105)},
-        {'center': (0.232389, 37.375075), 'anchor': (-30, -13)},
-        {'center': (9.921023, 77.617712), 'anchor': (-30, 77)},
-    ]
-
-    radius_deg = 2.0
-    inset_size = 0.085
-
-    # Coordinate-order-aware slicing for robust inset extraction
-    x0, x1 = float(raster_plot_data.x.values[0]), float(raster_plot_data.x.values[-1])
-    y0, y1 = float(raster_plot_data.y.values[0]), float(raster_plot_data.y.values[-1])
-    x_ascending = x1 > x0
-    y_ascending = y1 > y0
-
-    for ins in inset_defs:
-        clat, clon = ins['center']
-        alat, alon = ins['anchor']
-
-        x_rob, y_rob = robinson.transform_point(alon, alat, platecarree)
-        disp = ax.transData.transform([x_rob, y_rob])
-        fx, fy = fig.transFigure.inverted().transform(disp)
-
-        ax_ins = fig.add_axes(
-            [fx - inset_size / 2, fy - inset_size / 2, inset_size, inset_size],
-            projection=platecarree
+    # The base each probability is conditioned on (natural / moderately
+    # modified in 2020) is carried by the map itself - out-of-base land is drawn
+    # in its own flat colour - and by the caption, so the colorbar states only
+    # the event. The strict inequality is exact, not a loosening: the predictive
+    # distribution is a continuous spline, so P(HM >= c) and P(HM > c) are the
+    # same number, and "> 0.1" is the one that matches "natural is HM <= 0.1".
+    for panel, level, label in (
+        ('a', config.LOW_CUT, f'P(HM > {config.LOW_CUT:g})'),
+        ('b', config.HIGH_CUT, f'P(HM > {config.HIGH_CUT:g})'),
+    ):
+        p_base, base, land = _load_exceedance(year, level)
+        disp, land_c = _exceedance_display(p_base, land, stride)
+        _exceedance_map(
+            disp, land_c, cbar_label=label,
+            out_path=OUT / f'fig3{panel}_p{int(level * 100):02d}_map.png',
+            p_full=p_base, land_full=land,
         )
-        ax_ins.set_facecolor('#F4FCFF')
-        ax_ins.set_extent(
-            [clon - radius_deg, clon + radius_deg, clat - radius_deg, clat + radius_deg],
-            crs=platecarree
-        )
+        del p_base, base, land, disp, land_c
 
-        x_min = clon - radius_deg - 0.1
-        x_max = clon + radius_deg + 0.1
-        y_min = clat - radius_deg - 0.1
-        y_max = clat + radius_deg + 0.1
-
-        x_slice = slice(x_min, x_max) if x_ascending else slice(x_max, x_min)
-        y_slice = slice(y_min, y_max) if y_ascending else slice(y_max, y_min)
-
-        sub = raster_plot_data.sel(x=x_slice, y=y_slice)
-
-        if {'x', 'y'}.issubset(sub.dims) and sub.sizes.get('x', 0) > 1 and sub.sizes.get('y', 0) > 1:
-            sub2d = sub.compute()
-            vals = np.asarray(sub2d.values)
-            if vals.ndim == 2 and vals.shape[0] > 1 and vals.shape[1] > 1:
-                ax_ins.pcolormesh(
-                    sub2d.x.values,
-                    sub2d.y.values,
-                    vals,
-                    cmap=inset_cmap,
-                    vmin=0,
-                    vmax=4,
-                    transform=platecarree,
-                    shading='auto'
-                )
-
-        theta = np.linspace(0, 2 * np.pi, 200)
-        verts = np.column_stack([
-            clon + radius_deg * np.cos(theta),
-            clat + radius_deg * np.sin(theta)
-        ])
-        codes = [mpath.Path.MOVETO] + [mpath.Path.LINETO] * (len(theta) - 1)
-        circle_path = mpath.Path(verts, codes)
-        ax_ins.set_boundary(circle_path, transform=platecarree)
-
-        border = Circle((0.5, 0.5), 0.5, transform=ax_ins.transAxes,
-                        facecolor='none', edgecolor='black', linewidth=0.3, zorder=6)
-        ax_ins.add_patch(border)
-
-        ax_ins.set_xticks([])
-        ax_ins.set_yticks([])
-        for spine in ax_ins.spines.values():
-            spine.set_visible(False)
-
-        # Same inset-location marker placement/style as Figure 1
-        x_loc, y_loc = robinson.transform_point(clon, clat, platecarree)
-        ax.plot(
-            x_loc,
-            y_loc,
-            'o',
-            color='black',
-            markersize=4,
-            markerfacecolor='none',
-            markeredgewidth=0.4,
-            transform=ax.transData,
-            zorder=10
-        )
-
-    fig.savefig(OUT / 'fig3_uncer_map_hr.png', dpi=config.DPI_MAP, bbox_inches='tight')
 
 
 def figS1_S4():
@@ -349,141 +248,278 @@ def figS1_S4():
         fig.savefig(OUT / fname, dpi=config.DPI_MAP, bbox_inches='tight')
 
 
-def fig4_5():
-    OUT.mkdir(parents=True, exist_ok=True)
-    # ------------------------------------------------------------------
-    # Data (shared by Figure 4 and Figure 5)
-    # ------------------------------------------------------------------
-    # Every count in Figures 4 and 5 is a tally of these cells, so they are
-    # loaded onto the equal-area analysis grid: on the native EPSG:4326 grid a
-    # bar height counts pixels, which over-weights high latitudes.
-    #
-    # masked=True is load-bearing. Opening unmasked leaves nodata as raw
-    # 3.4e38, and ocean-minus-ocean is then exactly 0.0 - finite, inside the
-    # plot range, and indistinguishable from a real "no change" observation.
-    # split_mask == 2 is 73% ocean, so that silently made three quarters of
-    # both figures phantom samples stacked on the origin.
-    import contextlib as _contextlib
-    with _contextlib.ExitStack() as _stack:
-        with rasterio.open(config.PATHS['hm_2020_aa']) as _ref:
-            _grid = utils.equal_area_grid(_ref)
+# --- Figures 4 and 5: predicted distributions against the observations -------
+#
+# Both are built from one pass over the hindcast quantile store (_fig4_sample).
+# Figure 4 is the change histogram - observed, predicted-from-the-distribution
+# and predicted-from-the-mean - and Figure 5 is the PIT calibration histogram,
+# which used to be panel (b) of the same figure and now stands alone.
+#
+# The hexbin of observed against expected change that used to be Figure 4 is no
+# longer rendered.
 
-        def _layer(key, **kw):
-            return utils.open_equal_area_da(_stack, config.PATHS[key], _grid,
-                                            chunks='auto', **kw)
+# The bins Figure 4 has always used, and the labels that go with them.
+FIG4_BIN_EDGES = np.array([-1.0, -0.05, 0.0, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0])
+FIG4_BIN_LABELS = [
+    '-1 to -0.05', '-0.05 to 0', '0 to 0.005', '0.005 to 0.02',
+    '0.02 to 0.05', '0.05 to 0.1', '0.1 to 0.2', '0.2 to 0.5', '0.5 to 1',
+]
 
-        ds_obs2000 = _layer('hm_2000_aa')
-        ds_obs = _layer('hm_2020_aa')
-        ds_pred = _layer('pred_2020_central')
-        # Categorical: uint8 classes 0-4, no declared nodata. 255 is absent
-        # from the data, and naming it keeps the VRT uint8 instead of letting
-        # a NaN fill promote it to float64.
-        splitmask = _layer('split_mask', src_nodata=255, fill=255)
+# Bar order, colour and legend text. The two predicted bars are deliberately
+# shades of one hue: they are the same forecast read two ways, and the gap
+# between them is the figure's point - the mean is a single number per pixel
+# and lands in one bin, while the distribution spreads that pixel's weight
+# across every bin it reaches.
+FIG4_SERIES = [
+    ('observed',      'Observed',                '#58c785'),
+    ('expected',      'Predicted (distribution)', '#5fa0d3'),
+    ('central',       'Predicted (mean)',        '#22405c'),
+]
 
-        ds_diff = xr.Dataset({'obs': ds_obs - ds_obs2000,
-                              'pred': ds_pred - ds_obs2000})
 
-        # mask to where split == 2 (validation set)
-        val_mask = splitmask == 2
-        ds_diff_masked = ds_diff.where(val_mask, drop=False)
+def _row_area_km2(lats, dlat=0.009, dlon=0.009):
+    """Ground area of one native cell in each row, km2.
 
-        obs_vals = ds_diff_masked['obs'].values.ravel()
-        pred_vals = ds_diff_masked['pred'].values.ravel()
+    A geographic cell spanning [lat1, lat2] x dlon has exact spherical area
+    R^2 * dlon * (sin lat2 - sin lat1). Using it as a per-pixel weight makes
+    the sample area-fair without warping anything, which matters because the
+    quantile store is only readable on its native grid.
+    """
+    r = utils.AUTHALIC_RADIUS_M
+    top = np.radians(lats + dlat / 2.0)
+    bottom = np.radians(lats - dlat / 2.0)
+    return (r ** 2 * np.radians(dlon) * (np.sin(top) - np.sin(bottom))) / 1e6
 
-    valid = np.isfinite(obs_vals) & np.isfinite(pred_vals)
-    obs_flat = obs_vals[valid]
-    pred_flat = pred_vals[valid]
-    del obs_vals, pred_vals, valid
-    print(f"  Fig 4/5 sample: {obs_flat.size:,} equal-area land cells "
-          f"({obs_flat.size * (config.EQUAL_AREA_RES / 1000.0) ** 2:,.0f} km2)")
 
-    # ------------------------------------------------------------------
-    # Figure 4: obs vs pred hexbin
-    # ------------------------------------------------------------------
-    # Clip to plot range
-    vmin, vmax = 0.0, 0.2
-    mask_range = (obs_flat >= vmin) & (obs_flat <= vmax) & (pred_flat >= vmin) & (pred_flat <= vmax)
-    obs_plot = obs_flat[mask_range]
-    pred_plot = pred_flat[mask_range]
+def _fig4_sample():
+    """Accumulate Figures 4 and 5 from the hindcast quantile store.
 
-    # Create figure
-    fig, ax = plt.subplots(figsize=(6.5, 5.5))
+    Reads chunk-aligned 512x512 tiles - each is exactly one icechunk chunk, so
+    a tile costs one read rather than four - and folds each straight into the
+    accumulators. The raw quantile functions are never all held at once: a
+    million pixels x 64 levels would be gigabytes, and nothing downstream needs
+    them after the per-tile reduction.
 
-    # 2D histogram with log-scaled colour using cubehelix
-    hb = ax.hexbin(
-        obs_plot, pred_plot,
-        gridsize=150,
-        cmap='cubehelix',
-        norm=mcolors.LogNorm(vmin=1, vmax=1e6),
-        mincnt=1,
-        extent=[vmin, vmax, vmin, vmax],
-    )
+    Returns a dict with, per bin, the observed weighted count, the expected
+    weighted count under the full distributions and the weighted count under
+    the central (mean) surface; plus the PIT values and their weights.
 
-    # 1:1 reference line
-    ax.plot(
-        [vmin, vmax], [vmin, vmax],
-        linestyle='--', color='grey', linewidth=1, label='1:1 line'
-    )
+    The three bar series come off the *same* tiles and the same weights, which
+    is the only way the comparison is honest: the central surface is read from
+    its own raster in the same window rather than from a separately-sampled
+    equal-area pass, so nothing but the estimator differs between the bars.
 
-    # Colour bar
-    cb = fig.colorbar(hb, ax=ax, pad=0.02)
-    cb.set_label('Cell count, 1 km equal-area (log scale)', fontsize=14)
-    cb.ax.tick_params(labelsize=10)
+    Weights are the ground area of each native cell in equal-area cell
+    equivalents, so a bar height keeps meaning "1 km equal-area cells" as it
+    always has.
+    """
+    ds = quantiles.open_qf('hindcast')
+    p = quantiles.levels(ds)
+    times = np.asarray(ds['time'].values)
+    t_index = int(np.argmin(np.abs(times - 2020)))
+    store_lat = np.asarray(ds['latitude'].values)
 
-    # Axis labels – using "change" consistently
-    ax.set_xlabel('Observed change', fontsize=14)
-    ax.set_ylabel('Modelled change', fontsize=14)
-    ax.set_xlim(vmin, vmax)
-    ax.set_ylim(vmin, vmax)
-    ax.set_aspect('equal')
-    ax.tick_params(axis='both', labelsize=10)
-    ax.legend(loc='upper left', fontsize=12)
+    size = quantiles.CHUNK
+    cell_km2 = (config.EQUAL_AREA_RES / 1000.0) ** 2
+    rng = np.random.default_rng(config.FIG5_SEED)
 
-    plt.tight_layout()
-    plt.savefig(str(OUT / 'fig4_obs_vs_pred_change_hexbin.png'), dpi=config.DPI_PLOT, bbox_inches='tight')
-    plt.show()
+    n_bins = len(FIG4_BIN_EDGES) - 1
+    acc = {
+        'observed': np.zeros(n_bins), 'expected': np.zeros(n_bins),
+        'central': np.zeros(n_bins), 'pit': [], 'pit_w': [],
+        'n_pixels': 0, 'n_blocks': 0, 'area_km2': 0.0,
+    }
 
-    # ------------------------------------------------------------------
-    # Figure 5: obs vs pred hist
-    # ------------------------------------------------------------------
-    bin_edges = np.array([-1.0, -0.05, 0.0, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0])
-    bin_labels = [
-        '-1 to -0.05',
-        '-0.05 to 0',
-        '0 to 0.005',
-        '0.005 to 0.02',
-        '0.02 to 0.05',
-        '0.05 to 0.1',
-        '0.1 to 0.2',
-        '0.2 to 0.5',
-        '0.5 to 1',
-    ]
+    with contextlib.ExitStack() as stack:
+        hm00 = stack.enter_context(rasterio.open(config.PATHS['hm_2000_aa']))
+        hm20 = stack.enter_context(rasterio.open(config.PATHS['hm_2020_aa']))
+        # E[Q] for 2020, the mean of the same predictive distribution the
+        # quantile store holds - so the third bar is a different summary of one
+        # forecast, not a different forecast.
+        cen20 = stack.enter_context(
+            rasterio.open(config.PATHS['pred_2020_central']))
+        split = (stack.enter_context(rasterio.open(config.PATHS['split_mask']))
+                 if config.VALIDATION_SPLIT is not None else None)
 
-    obs_counts, _ = np.histogram(obs_flat, bins=bin_edges)
-    pred_counts, _ = np.histogram(pred_flat, bins=bin_edges)
+        n_rows, n_cols = hm20.height // size, hm20.width // size
+        order = rng.permutation(n_rows * n_cols)
 
-    x = np.arange(len(bin_labels))
-    width = 0.35
+        for flat in order:
+            if acc['n_blocks'] >= config.FIG5_N_BLOCKS:
+                break
+            r0 = int(flat // n_cols) * size
+            c0 = int(flat % n_cols) * size
+            window = rasterio.windows.Window(c0, r0, size, size)
 
-    fig, ax = plt.subplots(figsize=(8.55, 4.36))
+            # Cheap rasters first: skip a tile before paying for its 33 MB
+            # quantile chunk.
+            if split is None:
+                keep = np.ones((size, size), dtype=bool)
+            else:
+                keep = split.read(1, window=window) == config.VALIDATION_SPLIT
+                if keep.sum() < 1000:
+                    continue
+            y0 = utils.read_masked(hm00, window)
+            y1 = utils.read_masked(hm20, window)
+            yc = utils.read_masked(cen20, window)
+            keep &= np.isfinite(y0) & np.isfinite(y1) & np.isfinite(yc)
+            if keep.sum() < 1000:
+                continue
 
-    ax.bar(x - width / 2, obs_counts, width, color='#58c785', label='Observed')
-    ax.bar(x + width / 2, pred_counts, width, color='#5fa0d3', label='Predicted')
+            v = quantiles.block_qf(ds, r0, c0, t_index, size=size)
+            keep &= np.isfinite(v).all(axis=0)
+            n = int(keep.sum())
+            if n < 1000:
+                continue
+
+            rows = np.nonzero(keep)[0]
+            w = _row_area_km2(store_lat[r0:r0 + size])[rows] / cell_km2
+            vk = v[:, keep].astype(np.float64)
+            base = y0[keep].astype(np.float64)
+            obs_change = y1[keep].astype(np.float64) - base
+            cen_change = yc[keep].astype(np.float64) - base
+
+            # The predictive distribution is over the HM *level* in 2020, and
+            # the 2000 observation is a constant per pixel, so the distribution
+            # of change is the same one with its axis shifted. Shifting the bin
+            # edges per pixel is exactly equivalent and costs nothing.
+            probs = quantiles.bin_probs(p, vk, FIG4_BIN_EDGES[:, None] + base[None, :])
+
+            acc['expected'] += (probs * w).sum(axis=1)
+            acc['observed'] += np.histogram(obs_change, bins=FIG4_BIN_EDGES,
+                                            weights=w)[0]
+            # The mean surface collapses each pixel's distribution to one
+            # number, so this is an ordinary histogram of a point prediction -
+            # the same tally the observed bar gets.
+            acc['central'] += np.histogram(cen_change, bins=FIG4_BIN_EDGES,
+                                           weights=w)[0]
+            # PIT of the observed 2020 level under its own predictive law -
+            # identical to the PIT of the change, since the shift cancels.
+            acc['pit'].append(quantiles.pit(p, vk, y1[keep].astype(np.float64), rng))
+            acc['pit_w'].append(w)
+            acc['n_pixels'] += n
+            acc['area_km2'] += float(w.sum()) * cell_km2
+            acc['n_blocks'] += 1
+            del v, vk, probs
+
+    acc['pit'] = np.concatenate(acc['pit']) if acc['pit'] else np.array([])
+    acc['pit_w'] = np.concatenate(acc['pit_w']) if acc['pit_w'] else np.array([])
+    scope = ('all land (k-fold holdout, every pixel out of sample)'
+             if config.VALIDATION_SPLIT is None
+             else f'split_mask == {config.VALIDATION_SPLIT}')
+    print(f"  Fig 4/5 sample: {acc['n_pixels']:,} pixels from "
+          f"{acc['n_blocks']} tiles ({acc['area_km2']:,.0f} km2); {scope}")
+    return acc
+
+
+def _fig4_plot(acc, out_path):
+    """Figure 4: the observed change histogram against two readings of the forecast.
+
+    Three bars per bin, all tallies of the same cells with the same area
+    weights:
+
+      Observed                 where the 2020 observation actually landed
+      Predicted (distribution) the expected count - the sum over pixels of that
+                               pixel's probability of landing in the bin, so one
+                               pixel contributes a fraction to several bins
+      Predicted (mean)         the same forecast collapsed to E[Q] per pixel and
+                               tallied like an observation, so one pixel
+                               contributes 1 to exactly one bin
+
+    The third bar is what the old point-prediction figure showed, and it sits
+    here to make the cost of collapsing a distribution visible: a mean
+    concentrates mass near the middle of the range and under-fills both tails,
+    while the distribution bar reproduces them.
+
+    The axis stays logarithmic - the bins span five orders of magnitude - but
+    the label no longer says so, because the tick labels already do.
+    """
+    x = np.arange(len(FIG4_BIN_LABELS))
+    width = 0.8 / len(FIG4_SERIES)
+    offsets = (np.arange(len(FIG4_SERIES)) - (len(FIG4_SERIES) - 1) / 2) * width
+
+    fig, ax = plt.subplots(figsize=(10.5, 5.2))
+
+    for (key, label, colour), off in zip(FIG4_SERIES, offsets):
+        ax.bar(x + off, acc[key], width, color=colour, label=label)
 
     ax.set_yscale('log')
-    ax.set_title('', fontweight='bold')
-    ax.set_xlabel('HM Change (2000 - 2020)', fontweight='bold', fontsize=13)
-    ax.set_ylabel('Cell count, 1 km equal-area (log scale)',
-                  fontweight='bold', fontsize=13)
+    ax.set_xlabel('HM change (2000 - 2020)', fontweight='bold', fontsize=13)
+    ax.set_ylabel('Pixel count', fontweight='bold', fontsize=12)
     ax.set_xticks(x)
-    ax.set_xticklabels(bin_labels, rotation=45, ha='right', fontsize=12)
+    ax.set_xticklabels(FIG4_BIN_LABELS, rotation=45, ha='right', fontsize=11)
     ax.tick_params(axis='y', labelsize=11)
     ax.grid(axis='y', alpha=0.3)
-    ax.legend(loc='upper right', fontsize=12)
+    ax.legend(loc='upper right', fontsize=11)
 
-    plt.tight_layout()
-    plt.savefig(str(OUT / 'fig5_obs_vs_pred_hist.png'), dpi=config.DPI_PLOT, bbox_inches='tight')
-    plt.show()
+    fig.tight_layout()
+    fig.savefig(str(out_path), dpi=config.DPI_PLOT, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  saved {out_path.name}')
+
+
+def _fig5_plot(acc, out_path, n_bins=None):
+    """Figure 5: PIT calibration, previously panel (b) of Figure 4.
+
+    The PIT is uniform exactly when each pixel's own predictive distribution is
+    right, which is the thing the bar chart cannot show - a set of forecasts can
+    reproduce the aggregate histogram while being wrong pixel by pixel.
+
+    `n_bins` defaults to config.FIG5_PIT_BINS. It is worth keeping coarse. The
+    pixels are strongly spatially correlated, so a 512x512 tile carries closer
+    to one draw's worth of information than to 260,000; the effective sample
+    size tracks the tile count, and a fine histogram resolves wiggles the sample
+    cannot support. The departures visible at 7 bins are not sampling noise -
+    they survive going from 48 tiles to 200, and are unchanged to three decimals
+    if the quantile function is interpolated in normal-score space instead of
+    linearly in u.
+    """
+    if n_bins is None:
+        n_bins = config.FIG5_PIT_BINS
+
+    pit, w = acc['pit'], acc['pit_w']
+    counts, edges = np.histogram(pit, bins=n_bins, range=(0, 1), weights=w)
+    density = counts / counts.sum() * n_bins
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.8))
+    ax.bar(edges[:-1], density, width=1.0 / n_bins, align='edge',
+           color='#5fa0d3', edgecolor='white', linewidth=0.4)
+    ax.axhline(1.0, color='#22405c', linestyle='--', linewidth=1.2,
+               label='Calibrated (uniform)')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, max(1.6, float(density.max()) * 1.12))
+    ax.set_xlabel('PIT:  $F_{pred}(y_{obs})$', fontweight='bold', fontsize=13)
+    ax.set_ylabel('Density', fontweight='bold', fontsize=12)
+    ax.tick_params(labelsize=11)
+    ax.grid(axis='y', alpha=0.3)
+    ax.legend(loc='upper center', fontsize=11, frameon=False)
+
+    fig.tight_layout()
+    fig.savefig(str(out_path), dpi=config.DPI_PLOT, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  saved {out_path.name}  ({n_bins} bins)')
+
+
+def fig4_5():
+    """Figures 4 and 5, from one pass over the hindcast quantile store.
+
+    Figure 4 is the change histogram; Figure 5 is the PIT calibration
+    histogram, which used to be panel (b) of the same figure.
+
+    What is gone. Figure 4 was a hexbin of observed against expected change on
+    the equal-area grid, and its whole equal-area load went with it. The
+    histogram carries the same comparison on the same sample and adds the two
+    things the hexbin could not show side by side: the full predictive
+    distribution, and what collapsing it to its mean costs.
+
+    The remaining sample weights each native pixel by its ground area rather
+    than warping, because the quantile store is only readable on its native
+    grid - the same area correction, applied per pixel.
+    """
+    OUT.mkdir(parents=True, exist_ok=True)
+    acc = _fig4_sample()
+    _fig4_plot(acc, OUT / 'fig4_obs_vs_pred_dist.png')
+    _fig5_plot(acc, OUT / 'fig5_pit_calibration.png')
 
 
 def figSX():
@@ -679,7 +715,7 @@ def figSX():
             pos_l = row0_hm_axes[s].get_position()
             pos_r = bm_axes[s].get_position()
             x_center = (pos_l.x0 + pos_r.x1) / 2
-            y_top = max(pos_l.y1, pos_r.y1) + 0.015
+            y_top = max(pos_l.y1, pos_r.y1, bm_axes[s].get_position().y1) + 0.015
             fig.text(x_center, y_top,
                      f'Site {s+1}: {lat_s}, {lon_s}',
                      ha='center', va='bottom', fontsize=18, fontweight='bold')
@@ -719,6 +755,15 @@ def figSX():
 
 
 def fig6():
+    """Figure 6: observed vs predicted change at two sites, with loss risk.
+
+    Each site now gets three columns instead of two. The third carries what the
+    old figure could not show: for land that was natural in 2000, the model's
+    probability that it has crossed HM >= 0.10 by each year. The central
+    prediction in column two answers "how much"; column three answers "how
+    likely", and they are different questions - a pixel can have a small
+    expected change and still carry a large probability of crossing the line.
+    """
     OUT.mkdir(parents=True, exist_ok=True)
     utils.register_coolwarm_cmap()
     # ------------------------------------------------------------------
@@ -747,30 +792,27 @@ def fig6():
         'pred': ds_preddiff
     })
     ds_diff = ds_diff.assign_coords(time=pd.to_datetime([2005, 2010, 2015, 2020], format='%Y'))
-    print(ds_diff)
+
+    years = list(config.HINDCAST_YEARS)
+    # The hindcast probability rasters are on the same grid but were written by
+    # a different tool, so they are only ever indexed positionally here - never
+    # combined with the HM arrays through xarray, which would silently
+    # inner-join on coordinates (see utils.align_like).
+    ds_p10 = [rxr.open_rasterio(config.PATHS[f'hm_p10_{y}'], chunks='auto',
+                                masked=True).squeeze(drop=True) for y in years]
 
     # ------------------------------------------------------------------
-    # Custom colormap + norm
+    # Figure 6: obs vs predicted, predetermined sites
     # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Figure 6: obs vs predicted predetermined sites
-    # ------------------------------------------------------------------
-    #put code here
-
-    # Squeeze band dimension
     hm2000 = ds_obs2000.squeeze('band')
     patch_size = 128
 
     # ---------- predetermined site centres ----------
-    -11.5920,20.0837
     site_coords = [
-        (-10.1163,32.1712),    # Site 1: zambia
-        (-26.02, -61.92),  # Site 2: granchaco argentina
-
+        (-10.1163, 32.1712),   # Site 1: Muchinga, Zambia
+        (-26.02, -61.92),      # Site 2: Gran Chaco, Argentina
     ]
 
-    years = [2005, 2010, 2015, 2020]
     sites_info = []
 
     for lat_c, lon_c in site_coords:
@@ -789,21 +831,28 @@ def fig6():
         xsl = slice(x0, x0 + patch_size)
 
         hm_patch = hm2000.isel(y=ysl, x=xsl).compute().values
+        # Natural in 2000 is the base for every probability panel in this
+        # column. The cut is closed at the top - HM <= 0.10, see config.LOW_CUT.
+        natural = np.isfinite(hm_patch) & (hm_patch <= config.LOW_CUT)
 
-        obs_patches, pred_patches = [], []
+        obs_patches, pred_patches, p10_patches = [], [], []
         for t in range(4):
             obs_p = ds_diff['obs'].isel(time=t).squeeze('band').isel(y=ysl, x=xsl).compute().values
             pred_p = ds_diff['pred'].isel(time=t).squeeze('band').isel(y=ysl, x=xsl).compute().values
             obs_patches.append(np.nan_to_num(obs_p, nan=0.0))
             pred_patches.append(np.nan_to_num(pred_p, nan=0.0))
+            p = ds_p10[t].isel(y=ysl, x=xsl).compute().values
+            p10_patches.append(np.where(natural, p, np.nan))
 
         lons = hm2000.x.values[x0:x0 + patch_size]
         lats = hm2000.y.values[y0:y0 + patch_size]
 
         sites_info.append({
             'hm2000': hm_patch,
+            'natural': natural,
             'obs_diff': obs_patches,
             'pred_diff': pred_patches,
+            'p10': p10_patches,
             'lon_c': float(np.mean(lons)),
             'lat_c': float(np.mean(lats)),
             'extent': [float(lons.min()), float(lons.max()),
@@ -816,33 +865,41 @@ def fig6():
     print("Done.")
 
     # Format lat/lon with N/S E/W
-    predetermined_labels = ['Muchinga, Zambia','Chaco, Argentina']
+    predetermined_labels = ['Muchinga, Zambia', 'Chaco, Argentina']
     for i, s in enumerate(sites_info):
         lat_s, lon_s = fmt_coord(s['lat_c'], s['lon_c'])
         print(f"{predetermined_labels[i]}: {lat_s}, {lon_s}")
 
-    # ---------- build the 5x4 figure ----------
-    fig = plt.figure(figsize=(16, 20))
+    # ---------- build the 5x6 figure ----------
+    fig = plt.figure(figsize=(21, 19))
 
-    # Columns: site1_obs, site1_pred, gap, site2_obs, site2_pred
-    gs = fig.add_gridspec(5, 5, hspace=0.12, wspace=0.08,
-                          width_ratios=[1, 1, 0.15, 1, 1])
+    # Columns: site1 x3, gap, site2 x3
+    gs = fig.add_gridspec(5, 7, hspace=0.12, wspace=0.08,
+                          width_ratios=[1, 1, 1, 0.15, 1, 1, 1])
 
     cmap_hm = 'viridis'
     cmap_diff = plt.get_cmap('my_custom_coolwarm').copy()
     cmap_diff.set_bad(color='#E4E4E4')
     vmin_d, vmax_d = -0.2, 0.2
+    cmap_p, norm_p = utils.exceedance_cmap_norm()
+    cmap_p = cmap_p.copy()
+    # Out of base within the patch reads as the same beige the global maps use.
+    cmap_p.set_bad(color=config.OUT_OF_BASE_HEX)
+    # Natural / not natural in 2000, coloured so the beige marks exactly the
+    # pixels that are beige in the probability panels below it.
+    cmap_natural = mcolors.ListedColormap([config.OUT_OF_BASE_HEX, '#8fbf9f'])
 
-    im_hm = im_diff = None
+    im_hm = im_diff = im_p = None
     row0_hm_axes = []
     bm_axes = []
+    row0_last_axes = []          # third column, for centring the site label
 
-    # site 0 -> cols 0,1; site 1 -> cols 3,4 (col 2 = gap)
-    for s, (site, c0, bm_img) in enumerate(zip(sites_info, [0, 3], basemap_imgs)):
+    # site 0 -> cols 0,1,2; site 1 -> cols 4,5,6 (col 3 = gap)
+    for s, (site, c0, bm_img) in enumerate(zip(sites_info, [0, 4], basemap_imgs)):
         # Row 0, col c0: observed HM 2000
         ax = fig.add_subplot(gs[0, c0])
         im_hm = ax.imshow(site['hm2000'], cmap=cmap_hm, vmin=0, vmax=1,
-                           aspect='auto', interpolation='nearest')
+                          aspect='auto', interpolation='nearest')
         ax.set_title('Observed HM 2000', fontsize=14, pad=6)
         ax.set_xticks([]); ax.set_yticks([])
         row0_hm_axes.append(ax)
@@ -854,7 +911,16 @@ def fig6():
         ax_bm.set_xticks([]); ax_bm.set_yticks([])
         bm_axes.append(ax_bm)
 
-        # Rows 1-4: observed and predicted HM change
+        # Row 0, col c0+2: natural / not natural in 2000
+        ax_i = fig.add_subplot(gs[0, c0 + 2])
+        ax_i.imshow(site['natural'].astype(float), cmap=cmap_natural,
+                    vmin=0, vmax=1, aspect='auto', interpolation='nearest')
+        ax_i.set_title(f'Natural in 2000  (HM $\\leq$ {config.LOW_CUT:g})',
+                       fontsize=14, pad=6)
+        ax_i.set_xticks([]); ax_i.set_yticks([])
+        row0_last_axes.append(ax_i)
+
+        # Rows 1-4: observed change, predicted change, probability of loss
         for r, year in enumerate(years):
             ax_o = fig.add_subplot(gs[r + 1, c0])
             im_diff = ax_o.imshow(site['obs_diff'][r], cmap=cmap_diff,
@@ -868,10 +934,17 @@ def fig6():
                         aspect='auto', interpolation='nearest')
             ax_p.set_xticks([]); ax_p.set_yticks([])
 
+            ax_r = fig.add_subplot(gs[r + 1, c0 + 2])
+            im_p = ax_r.imshow(site['p10'][r], cmap=cmap_p, norm=norm_p,
+                               aspect='auto', interpolation='nearest')
+            ax_r.set_xticks([]); ax_r.set_yticks([])
+
             # Column headers on the first change row only
             if r == 0:
                 ax_o.set_title('Observed change', fontsize=14, pad=6)
                 ax_p.set_title('Predicted change', fontsize=14, pad=6)
+                ax_r.set_title(f'P(HM > {config.LOW_CUT:g})',
+                               fontsize=14, pad=6)
 
             # Row year labels on the leftmost column only
             if c0 == 0:
@@ -882,11 +955,11 @@ def fig6():
     fig.subplots_adjust(bottom=0.06, top=0.94)
     fig.canvas.draw()
 
-    # ---------- site labels spanning two columns ----------
+    # ---------- site labels spanning the three columns ----------
     for s, site in enumerate(sites_info):
         lat_s, lon_s = fmt_coord(site['lat_c'], site['lon_c'])
         pos_l = row0_hm_axes[s].get_position()
-        pos_r = bm_axes[s].get_position()
+        pos_r = row0_last_axes[s].get_position()
         x_center = (pos_l.x0 + pos_r.x1) / 2
         y_top = max(pos_l.y1, pos_r.y1) + 0.015
         fig.text(x_center, y_top,
@@ -894,20 +967,28 @@ def fig6():
                  ha='center', va='bottom', fontsize=18, fontweight='bold')
 
     # ---------- colorbars ----------
-    cb1_ax = fig.add_axes([0.08, 0.025, 0.35, 0.012])
+    cb1_ax = fig.add_axes([0.07, 0.025, 0.24, 0.012])
     cb1 = fig.colorbar(im_hm, cax=cb1_ax, orientation='horizontal')
     cb1.set_label('HM 2000', fontsize=16)
-    cb1.ax.tick_params(labelsize=14)
+    cb1.ax.tick_params(labelsize=13)
 
-    cb2_ax = fig.add_axes([0.55, 0.025, 0.35, 0.012])
+    cb2_ax = fig.add_axes([0.38, 0.025, 0.24, 0.012])
     cb2 = fig.colorbar(im_diff, cax=cb2_ax, orientation='horizontal')
     cb2.set_label('HM change from 2000', fontsize=16)
-    cb2.ax.tick_params(labelsize=14)
+    cb2.ax.tick_params(labelsize=13)
+
+    cb3_ax = fig.add_axes([0.69, 0.025, 0.24, 0.012])
+    cb3 = fig.colorbar(im_p, cax=cb3_ax, orientation='horizontal',
+                       ticks=config.P_EXCEED_LEVELS, spacing='uniform')
+    cb3.set_label(f'P(HM > {config.LOW_CUT:g}) | natural in 2000',
+                  fontsize=16)
+    cb3.ax.set_xticklabels([f'{t:g}' for t in config.P_EXCEED_LEVELS])
+    cb3.ax.tick_params(labelsize=11)
 
     # ---------- globe insets ----------
     for site, ax_bm in zip(sites_info, bm_axes):
         pos = ax_bm.get_position()
-        ins = 0.06
+        ins = 0.05
         ax_g = fig.add_axes(
             [pos.x1 - ins - 0.005, pos.y1 - ins - 0.005, ins, ins],
             projection=ccrs.Orthographic(
@@ -921,67 +1002,38 @@ def fig6():
         ax_g.plot(site['lon_c'], site['lat_c'], 'ro',
                   markersize=4, transform=ccrs.PlateCarree(), zorder=10)
 
-    fig.savefig(str(OUT / 'fig_6_obs_vs_predicted_predetermined'), dpi=config.DPI_MAP, bbox_inches='tight')
-    plt.show()
+    fig.savefig(str(OUT / 'fig_6_obs_vs_predicted_predetermined.png'),
+                dpi=config.DPI_MAP, bbox_inches='tight')
+    plt.close(fig)
+    print('  saved fig_6_obs_vs_predicted_predetermined.png')
 
 
 def fig7():
+    """Figure 7: HM trajectories at four pixels, as full predictive distributions.
+
+    Three rows per pixel. The location map is unchanged. The time series
+    replaces the old lower/central/upper ribbon with the continuous quantile
+    fan - the ribbon showed three levels of a 64-level distribution and drew
+    the eye to its edges, which are the least well determined part of it. The
+    third row is the predictive density for 2020 on its own axis, with the 2000
+    starting point and the 2020 outcome marked, so the reader can see where the
+    truth landed inside the distribution rather than only whether it was
+    bracketed.
+    """
     OUT.mkdir(parents=True, exist_ok=True)
     # ------------------------------------------------------------------
     # Data prep
     # ------------------------------------------------------------------
-    # load HM data
-    ds_obs1990 = rxr.open_rasterio(config.PATHS['hm_1990_aa'], chunks='auto')
-    ds_obs1995 = rxr.open_rasterio(config.PATHS['hm_1995_aa'], chunks='auto')
-    ds_obs2000 = rxr.open_rasterio(config.PATHS['hm_2000_aa'], chunks='auto')
-    ds_obs2005 = rxr.open_rasterio(config.PATHS['hm_2005_aa'], chunks='auto')
-    ds_obs2010 = rxr.open_rasterio(config.PATHS['hm_2010_aa'], chunks='auto')
-    ds_obs2015 = rxr.open_rasterio(config.PATHS['hm_2015_aa'], chunks='auto')
-    ds_obs2020 = rxr.open_rasterio(config.PATHS['hm_2020_aa'], chunks='auto')
+    obs_keys = ['hm_1990_aa', 'hm_1995_aa', 'hm_2000_aa', 'hm_2005_aa',
+                'hm_2010_aa', 'hm_2015_aa', 'hm_2020_aa']
+    obs_years = np.array([1990, 1995, 2000, 2005, 2010, 2015, 2020], dtype=float)
+    ds_obs_layers = [rxr.open_rasterio(config.PATHS[k], chunks='auto',
+                                       masked=True).squeeze(drop=True)
+                     for k in obs_keys]
+    hm2000 = ds_obs_layers[2]
 
-    ds_pred2005_central = rxr.open_rasterio(config.PATHS['pred_2005_central'], chunks='auto')
-    ds_pred2005_upper = rxr.open_rasterio(config.PATHS['pred_2005_upper'], chunks='auto')
-    ds_pred2005_lower = rxr.open_rasterio(config.PATHS['pred_2005_lower'], chunks='auto')
-    ds_pred2010_central = rxr.open_rasterio(config.PATHS['pred_2010_central'], chunks='auto')
-    ds_pred2010_upper = rxr.open_rasterio(config.PATHS['pred_2010_upper'], chunks='auto')
-    ds_pred2010_lower = rxr.open_rasterio(config.PATHS['pred_2010_lower'], chunks='auto')
-    ds_pred2015_central = rxr.open_rasterio(config.PATHS['pred_2015_central'], chunks='auto')
-    ds_pred2015_upper = rxr.open_rasterio(config.PATHS['pred_2015_upper'], chunks='auto')
-    ds_pred2015_lower = rxr.open_rasterio(config.PATHS['pred_2015_lower'], chunks='auto')
-    ds_pred2020_central = rxr.open_rasterio(config.PATHS['pred_2020_central'], chunks='auto')
-    ds_pred2020_upper = rxr.open_rasterio(config.PATHS['pred_2020_upper'], chunks='auto')
-    ds_pred2020_lower = rxr.open_rasterio(config.PATHS['pred_2020_lower'], chunks='auto')
-
-    full_time = pd.to_datetime([1990, 1995, 2000, 2005, 2010, 2015, 2020], format='%Y')
-    pred_time = pd.to_datetime([2005, 2010, 2015, 2020], format='%Y')
-
-    ds_obs = xr.concat(
-        [ds_obs1990, ds_obs1995, ds_obs2000, ds_obs2005, ds_obs2010, ds_obs2015, ds_obs2020],
-        dim=pd.Index(full_time, name='time')
-    )
-
-    ds_pred_central = xr.concat(
-        [ds_pred2005_central, ds_pred2010_central, ds_pred2015_central, ds_pred2020_central],
-        dim=pd.Index(pred_time, name='time')
-    ).reindex(time=full_time)
-
-    ds_pred_upper = xr.concat(
-        [ds_pred2005_upper, ds_pred2010_upper, ds_pred2015_upper, ds_pred2020_upper],
-        dim=pd.Index(pred_time, name='time')
-    ).reindex(time=full_time)
-
-    ds_pred_lower = xr.concat(
-        [ds_pred2005_lower, ds_pred2010_lower, ds_pred2015_lower, ds_pred2020_lower],
-        dim=pd.Index(pred_time, name='time')
-    ).reindex(time=full_time)
-
-    ds_combined = xr.Dataset({
-        'observed': ds_obs,
-        'central': ds_pred_central,
-        'upper': ds_pred_upper,
-        'lower': ds_pred_lower
-    })
-    print(ds_combined)
+    ds_qf = quantiles.open_qf('hindcast')
+    qf_times = np.asarray(ds_qf['time'].values, dtype=float)
 
     # ------------------------------------------------------------------
     # Figure 7: timeseries
@@ -989,11 +1041,10 @@ def fig7():
 
     # ---------- setup ----------
     patch_size = 128
-    hm2000 = ds_obs2000.squeeze('band')
 
     site_coords = [
-        (-10.1163,32.1712),    # Site 1: zambia
-        (-26.02, -61.92),  # Site 2: chaco
+        (-10.1163, 32.1712),   # Site 1: Muchinga, Zambia
+        (-26.02, -61.92),      # Site 2: Gran Chaco, Argentina
     ]
     # ---------- build patches ----------
     site_patches = []
@@ -1022,76 +1073,59 @@ def fig7():
     basemap_imgs = [fetch_esri_satellite(s['extent'], size=512) for s in site_patches]
     print("Done.")
 
-    time_vals = ds_combined.time.values
-    years = [pd.Timestamp(t).year for t in time_vals]
+    def pixel_record(site_idx, py, px):
+        """Observations and the quantile function at one pixel of one patch."""
+        site = site_patches[site_idx]
+        abs_y = site['y0'] + py
+        abs_x = site['x0'] + px
+        lat = float(hm2000.y.values[abs_y])
+        lon = float(hm2000.x.values[abs_x])
+        observed = np.array([float(layer.isel(y=abs_y, x=abs_x).values)
+                             for layer in ds_obs_layers])
+        # sel(method='nearest') on the store rather than positional indexing:
+        # the store carries its own coordinates and we want them to agree with
+        # the HM grid on ground position, not on array index.
+        p, v_t, _, _ = quantiles.pixel_qf(ds_qf, lat, lon)
+        return {'site_idx': site_idx, 'py': py, 'px': px, 'lat': lat, 'lon': lon,
+                'observed': observed, 'p': p, 'v': v_t.T}      # v: (n_q, n_time)
 
-    # ---------- iterate seed 0-20 for site 2 ----------
+    # ---------- iterate seeds ----------
     for seed in config.FIG7_SEEDS:
         rng_site1 = np.random.default_rng(1000 + seed)
-        site_patches[0]['pixels'] = [(int(rng_site1.integers(0, patch_size)), int(rng_site1.integers(0, patch_size)))
-                                      for _ in range(2)]
-
-        pixel_data_site1 = []
-        for py, px in site_patches[0]['pixels']:
-            abs_y = site_patches[0]['y0'] + py
-            abs_x = site_patches[0]['x0'] + px
-            obs_ts = ds_combined['observed'].isel(band=0, y=abs_y, x=abs_x).compute().values
-            cen_ts = ds_combined['central'].isel(band=0, y=abs_y, x=abs_x).compute().values
-            upp_ts = ds_combined['upper'].isel(band=0, y=abs_y, x=abs_x).compute().values
-            low_ts = ds_combined['lower'].isel(band=0, y=abs_y, x=abs_x).compute().values
-            pixel_lat = float(hm2000.y.values[abs_y])
-            pixel_lon = float(hm2000.x.values[abs_x])
-            pixel_data_site1.append({
-                'site_idx': 0, 'py': py, 'px': px,
-                'lat': pixel_lat, 'lon': pixel_lon,
-                'observed': obs_ts, 'central': cen_ts, 'upper': upp_ts, 'lower': low_ts,
-            })
-
         rng_site2 = np.random.default_rng(seed)
-        site_patches[1]['pixels'] = [(int(rng_site2.integers(0, patch_size)), int(rng_site2.integers(0, patch_size)))
-                                      for _ in range(2)]
 
-        pixel_data_site2 = []
-        for py, px in site_patches[1]['pixels']:
-            abs_y = site_patches[1]['y0'] + py
-            abs_x = site_patches[1]['x0'] + px
-            obs_ts = ds_combined['observed'].isel(band=0, y=abs_y, x=abs_x).compute().values
-            cen_ts = ds_combined['central'].isel(band=0, y=abs_y, x=abs_x).compute().values
-            upp_ts = ds_combined['upper'].isel(band=0, y=abs_y, x=abs_x).compute().values
-            low_ts = ds_combined['lower'].isel(band=0, y=abs_y, x=abs_x).compute().values
-            pixel_lat = float(hm2000.y.values[abs_y])
-            pixel_lon = float(hm2000.x.values[abs_x])
-            pixel_data_site2.append({
-                'site_idx': 1, 'py': py, 'px': px,
-                'lat': pixel_lat, 'lon': pixel_lon,
-                'observed': obs_ts, 'central': cen_ts, 'upper': upp_ts, 'lower': low_ts,
-            })
+        pixel_data = []
+        for site_idx, rng in ((0, rng_site1), (1, rng_site2)):
+            for _ in range(2):
+                py = int(rng.integers(0, patch_size))
+                px = int(rng.integers(0, patch_size))
+                pixel_data.append(pixel_record(site_idx, py, px))
 
-        pixel_data = pixel_data_site1 + pixel_data_site2
         print(f"\n--- Seed {seed} ---")
 
         # ---------- build figure ----------
-        fig = plt.figure(figsize=(20, 9))
-        gs = fig.add_gridspec(2, 5, hspace=0.30, wspace=0.10,
+        fig = plt.figure(figsize=(20, 13))
+        gs = fig.add_gridspec(3, 5, hspace=0.34, wspace=0.10,
                               width_ratios=[1, 1, 0.15, 1, 1],
-                              height_ratios=[1, 1.3])
+                              height_ratios=[1, 1.3, 1.0])
 
         col_map = [0, 1, 3, 4]
-        predetermined_labels = ['Muchinga, Zambia','Chaco, Argentina']
+        predetermined_labels = ['Muchinga, Zambia', 'Chaco, Argentina']
+        fan_rgb = mcolors.to_rgb(config.FAN_COLOR)
 
         for i, (pxd, col) in enumerate(zip(pixel_data, col_map)):
             s_idx = pxd['site_idx']
             bm_img = basemap_imgs[s_idx]
             site = site_patches[s_idx]
+            p, v = pxd['p'], pxd['v']
+            observed = pxd['observed']
 
             # ---- Row 0: location map ----
             ax_loc = fig.add_subplot(gs[0, col])
             ax_loc.imshow(bm_img, aspect='auto', interpolation='bilinear')
 
             scale = 512 / patch_size
-            dot_x = pxd['px'] * scale
-            dot_y = pxd['py'] * scale
-            ax_loc.plot(dot_x, dot_y, 'ro', markersize=10,
+            ax_loc.plot(pxd['px'] * scale, pxd['py'] * scale, 'ro', markersize=10,
                         markeredgecolor='white', markeredgewidth=1.5, zorder=10)
             ax_loc.set_xticks([]); ax_loc.set_yticks([])
             lat_s, lon_s = fmt_coord(pxd['lat'], pxd['lon'])
@@ -1103,7 +1137,7 @@ def fig7():
 
             # Globe inset
             pos = ax_loc.get_position()
-            ins = 0.11
+            ins = 0.075
             ax_g = fig.add_axes(
                 [pos.x1 - ins - 0.003, pos.y1 - ins - 0.003, ins, ins],
                 projection=ccrs.Orthographic(
@@ -1117,38 +1151,100 @@ def fig7():
             ax_g.plot(pxd['lon'], pxd['lat'], 'ro',
                       markersize=4, transform=ccrs.PlateCarree(), zorder=10)
 
-            # ---- Row 1: time series ----
+            # ---- Row 1: quantile fan ----
             ax_ts = fig.add_subplot(gs[1, col])
 
-            valid = ~np.isnan(pxd['central'])
-            yrs_valid = np.array(years)[valid]
-            ax_ts.fill_between(yrs_valid, pxd['lower'][valid], pxd['upper'][valid],
-                                alpha=0.3, color='cornflowerblue', label='95% PI')
-            ax_ts.plot(yrs_valid, pxd['central'][valid], 'r--',
-                       linewidth=1.8, label='Predicted')
+            # Taper the fan back to the last observation before the first
+            # horizon, or it starts already wide and reads as uncertainty about
+            # a year the model was given.
+            t_a, v_a = quantiles.anchor_to_observation(
+                qf_times, v, obs_years, observed)
+            t_f, y_grid, A, M = quantiles.fan_image(
+                t_a, p, v_a, ny=config.FAN_NY, nt=config.FAN_NT,
+                mode='prob', gamma=config.FAN_GAMMA,
+                ref_time=float(qf_times[0]))
 
-            obs_valid = ~np.isnan(pxd['observed'])
-            ax_ts.plot(np.array(years)[obs_valid], pxd['observed'][obs_valid],
-                       'k-', linewidth=1.8, label='Observed')
+            rgba = np.zeros(A.shape + (4,))
+            rgba[..., :3] = fan_rgb
+            rgba[..., 3] = np.where(
+                M, config.FAN_ALPHA_MIN
+                + (config.FAN_ALPHA_MAX - config.FAN_ALPHA_MIN) * A, 0.0)
+            ax_ts.imshow(rgba, extent=[t_f[0], t_f[-1], y_grid[0], y_grid[-1]],
+                         origin='lower', aspect='auto',
+                         interpolation='bilinear', zorder=1)
 
-            ax_ts.set_xlabel('Year', fontsize=16)
+            k = int(np.argmin(np.abs(p - 0.5)))
+            # Red rather than white: the fan is opaque steelblue at the median,
+            # so a white line read as a gap in it, and it needed a grey legend
+            # patch to be visible at all. Red separates by hue from both the fan
+            # and the black observed line, and works on a plain white legend.
+            ax_ts.plot(t_a, v_a[k], color='#d62728', linewidth=1.2,
+                       linestyle='--', label='Median forecast', zorder=11)
+
+            fin = np.isfinite(observed)
+            ax_ts.plot(obs_years[fin], observed[fin], 'k-', linewidth=1.8,
+                       label='Observed', zorder=10)
+
+            ax_ts.set_xlabel('Year', fontsize=15)
             if col in (0, 3):
-                ax_ts.set_ylabel('HM', fontsize=16)
+                ax_ts.set_ylabel('HM', fontsize=15)
             else:
                 ax_ts.set_yticks([])
-            ax_ts.tick_params(labelsize=14)
+            ax_ts.tick_params(labelsize=13)
             ax_ts.set_xlim(1988, 2022)
             ax_ts.set_ylim(0, 1)
             ax_ts.set_xticks([1990, 1995, 2000, 2005, 2010, 2015, 2020])
-            ax_ts.set_xticklabels(['1990', '', '2000', '', '2010', '', '2020'], fontsize=14)
-
+            ax_ts.set_xticklabels(['1990', '', '2000', '', '2010', '', '2020'],
+                                  fontsize=13)
             if i == 0:
-                ax_ts.legend(fontsize=14, loc='upper left', framealpha=0.9)
+                ax_ts.legend(fontsize=13, loc='upper left', framealpha=0.95)
 
-        fig.savefig(str(OUT / f'fig_7_timeseries_site2seed{seed:02d}.png'), dpi=config.DPI_MAP, bbox_inches='tight')
+            # ---- Row 2: predictive density for the final hindcast year ----
+            ax_d = fig.add_subplot(gs[2, col])
+            v_last = v[:, -1]
+            start = observed[2]              # 2000, the base year
+            truth = observed[-1]             # 2020, the outcome
+
+            # One fixed window for all four panels. They used to be zoomed
+            # individually, which made a narrow distribution look as wide as a
+            # broad one; on a shared axis the panels are comparable. The lower
+            # edge is below zero so a density piled against the HM floor is not
+            # clipped by the spine. Anything above 0.5 is off the axis - the
+            # quantile function is still integrated over its whole support, only
+            # the view is cropped.
+            grid = np.linspace(*config.FIG7_DENSITY_XLIM, 500)
+            dens = quantiles.density(p, v_last, grid, smooth=4.0)
+
+            ax_d.fill_between(grid, dens, color=config.FAN_COLOR, alpha=0.45,
+                              linewidth=0)
+            ax_d.plot(grid, dens, color=config.FAN_COLOR, linewidth=1.4)
+            if np.isfinite(start):
+                ax_d.axvline(start, color='black', linewidth=1.6,
+                             label='Observed 2000')
+            if np.isfinite(truth):
+                ax_d.axvline(truth, color='#b8432a', linewidth=1.6,
+                             linestyle='--', label='Observed 2020')
+
+            ax_d.set_xlim(*config.FIG7_DENSITY_XLIM)
+            ax_d.set_ylim(bottom=0)
+            ax_d.set_yticks([])
+            ax_d.set_xticks([0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
+            ax_d.set_xlabel('Human Modification', fontsize=15)
+            if col in (0, 3):
+                ax_d.set_ylabel('Predicted\ndensity 2020', fontsize=13)
+            ax_d.tick_params(axis='x', labelsize=13)
+            for side in ('left', 'top', 'right'):
+                ax_d.spines[side].set_visible(False)
+            if i == 0:
+                ax_d.legend(fontsize=12, loc='upper right', framealpha=0.9)
+
+        out = OUT / f'fig_7_timeseries_site2seed{seed:02d}.png'
+        fig.savefig(str(out), dpi=config.DPI_MAP, bbox_inches='tight')
         plt.close(fig)
-        print("  Saved " + str(OUT / f"fig_7_timeseries_site2seed{seed:02d}.png"))
+        print(f'  Saved {out}')
 
+    utils.plot_quantile_fan_legend(OUT / 'fig7_fan_legend.png')
+    print(f'  Saved {OUT / "fig7_fan_legend.png"}')
     print(f"\nAll {len(config.FIG7_SEEDS)} iterations complete.")
 
 
@@ -1172,6 +1268,10 @@ def fig8_9():
             get = lambda k: utils.open_equal_area_da(          # noqa: E731
                 stack, config.PATHS[k], grid, chunks='auto')
             esri, cpi = get('esri_hm'), get('cpi_hm')
+            # The blended "central" surface is E[Q], the mean of the predictive
+            # distribution, so HM here is an expected change. ESRI and CPI are
+            # single surfaces, which is why this comparison stays a comparison
+            # of central tendencies rather than of distributions.
             hm = get('hm_central_2040') - get('hm_2020_aa')
         else:
             esri = rxr.open_rasterio(config.PATHS['esri_hm'], chunks='auto')
@@ -1273,13 +1373,13 @@ def fig8_9():
     for i, var in enumerate(cols):
         ax = g.axes[i, i]
         if ax is not None:
-            ax.set_ylabel('Count', fontsize=18)
+            ax.set_ylabel('Pixel count', fontsize=18)
             ax.tick_params(axis='both', labelsize=16)
 
     for i, row_var in enumerate(cols):
         ax = g.axes[i, 0]
         if ax is not None:
-            ax.set_ylabel('Count' if i == 0 else row_var, fontsize=18)
+            ax.set_ylabel('Pixel count' if i == 0 else row_var, fontsize=18)
 
     for j, col_var in enumerate(cols):
         ax = g.axes[len(cols) - 1, j]
@@ -1289,7 +1389,7 @@ def fig8_9():
     plot_axes = [ax for row in g.axes for ax in row if ax is not None]
     if hexbin_artists and plot_axes:
         cbar = g.fig.colorbar(hexbin_artists[0], ax=plot_axes, fraction=0.04, pad=0.03)
-        cbar.set_label('Pixel count (log scale)', fontsize=18)
+        cbar.set_label('Pixel count', fontsize=18)
         cbar.ax.tick_params(labelsize=16)
 
     g.fig.subplots_adjust(top=0.95, right=0.88, wspace=0.22, hspace=0.22)
@@ -1502,128 +1602,252 @@ def fig8_9():
     utils.plot_ternary_alpha_legend(OUT / 'fig9_ternary_alpha_legend.png')
 
 
+def _figS5_S6_map(bound, cbar_label, fname):
+    """One global Robinson map of a forecast bound, in the Figure 2 mould."""
+    ds = utils.load_hm_diff_bound(bound).to_dataset(name='hm')
+    ds = ds.drop('band').squeeze()
+    mask = ((ds['hm'] >= -1) & (ds['hm'] <= 1)).compute()
+    ds = ds.where(mask, drop=True)
+    ds['hm'] = ds['hm'].chunk({'x': 1024, 'y': 1024})
+    pds = ds['hm'].compute()
+
+    fig, ax = utils.build_global_robinson_map(
+        pds, cmap='my_custom_coolwarm', clim=config.CLIM,
+        cbar_label=cbar_label)
+    utils.add_circular_insets(fig, ax, pds, cmap='my_custom_coolwarm',
+                              vmin=config.CLIM[0], vmax=config.CLIM[1])
+    out = OUT / fname
+    fig.savefig(out, dpi=config.DPI_MAP, bbox_inches='tight')
+    plt.close(fig)
+    del ds, pds
+    print(f'  saved {out.name}')
+
+
 def figS5():
-    """Figure S5: HM change 2020->2040 as 11 regional zooms (Fig 1/2 styling)."""
+    """Figure S5: the lower bound of the 2020-2040 forecast, as a global map.
+
+    Was 11 regional zooms of the central surface - which duplicated Figure 2 at
+    a larger scale without adding a quantity. S5 and S6 now carry the two ends
+    of the predictive distribution on Figure 2's own scale and insets, so the
+    three maps read as one triptych: lower, mean, upper.
+
+    The bound is the 2.5th percentile of each pixel's own distribution, not a
+    scenario. See utils.load_hm_diff_bound.
+    """
     OUT.mkdir(parents=True, exist_ok=True)
-    OCEAN = config.OCEAN_HEX
-    TARGET_PX = config.TARGET_PX_ZOOM
-    cmap = mcolors.LinearSegmentedColormap.from_list("my_custom_coolwarm", config.COOLWARM_STOPS)
-    vmin, vmax = config.CLIM
-    cbar_label = "HM change 2020-2040"
-
-    def load_hm():
-        da = utils.load_hm_diff().squeeze(drop=True)
-        return da.where((da >= -1) & (da <= 1))
-
-    def subset_region(da, bbox, margin=1.0):
-        lon0, lon1, lat0, lat1 = bbox
-        x_asc = float(da.x[-1]) > float(da.x[0])
-        y_asc = float(da.y[-1]) > float(da.y[0])
-        xs = slice(lon0 - margin, lon1 + margin) if x_asc else slice(lon1 + margin, lon0 - margin)
-        ys = slice(lat0 - margin, lat1 + margin) if y_asc else slice(lat1 + margin, lat0 - margin)
-        sub = da.sel(x=xs, y=ys)
-        ny, nx = sub.sizes["y"], sub.sizes["x"]
-        stride = max(1, int(np.ceil(max(ny, nx) / TARGET_PX)))
-        return sub.isel(x=slice(None, None, stride), y=slice(None, None, stride)).compute()
-
-    def render(name, slug, bbox, sub):
-        fig = plt.figure(figsize=(9, 7))
-        ax = fig.add_subplot(projection=ccrs.Robinson())
-        ax.set_facecolor(OCEAN)
-        mesh = ax.pcolormesh(
-            sub.x.values, sub.y.values, sub.values,
-            transform=ccrs.PlateCarree(), cmap=cmap, vmin=vmin, vmax=vmax,
-            shading="auto", rasterized=True,
-        )
-        ax.set_extent(list(bbox), crs=ccrs.PlateCarree())
-        ax.spines["geo"].set_edgecolor("black")
-        ax.spines["geo"].set_linewidth(0.4)
-        ax.set_title(name, fontsize=13)
-        cbar = fig.colorbar(mesh, ax=ax, orientation="vertical",
-                            shrink=0.55, pad=0.02, extend="both")
-        cbar.set_label(cbar_label, fontsize=8)
-        cbar.ax.tick_params(labelsize=7, width=0.4, length=2)
-        cbar.outline.set_linewidth(0.3)
-        out = OUT / f"figS5_{slug}.png"
-        fig.savefig(out, dpi=config.DPI_PLOT, bbox_inches="tight")
-        plt.close(fig)
-        return out
-
-    da = load_hm()
-    for slug, (name, bbox) in config.REGIONS.items():
-        sub = subset_region(da, bbox)
-        out = render(name, slug, bbox, sub)
-        print(f"  saved {out.name}  ({sub.sizes['y']}x{sub.sizes['x']} cells)", flush=True)
+    utils.register_coolwarm_cmap()
+    bound, label, fname = config.FIGS_BOUND_VARIANTS[0]
+    _figS5_S6_map(bound, label, fname)
 
 
 def figS6():
-    """Figure S6: 2040 natural-lands forecast classes as 11 regional zooms."""
-    from matplotlib.patches import Patch
+    """Figure S6: the upper bound of the 2020-2040 forecast, as a global map.
+
+    Was 22 regional zooms of the two exceedance-probability fields (Figure 3's
+    content, region by region). Those probabilities are still in Figures 3a/3b;
+    S6 now shows the 97.5th percentile of each pixel's distribution, the
+    companion to S5. See figS5.
+    """
     OUT.mkdir(parents=True, exist_ok=True)
-    OCEAN = config.OCEAN_HEX
-    TARGET_PX = config.TARGET_PX_ZOOM
-    class_colors = config.CLASS_COLORS
-    class_labels = config.CLASS_LEGEND_LABELS
-    cmap = mcolors.ListedColormap(class_colors)
-    norm = mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5], cmap.N)
+    utils.register_coolwarm_cmap()
+    bound, label, fname = config.FIGS_BOUND_VARIANTS[1]
+    _figS5_S6_map(bound, label, fname)
 
-    def load_layers():
-        raster = rxr.open_rasterio(config.PATHS['raster_classes'], chunks="auto").squeeze(drop=True)
-        hm = utils.load_hm_diff().squeeze(drop=True)
-        return raster, hm
 
-    def subset_region(raster, hm, bbox, margin=1.0):
-        lon0, lon1, lat0, lat1 = bbox
-        x_asc = float(raster.x[-1]) > float(raster.x[0])
-        y_asc = float(raster.y[-1]) > float(raster.y[0])
-        xs = slice(lon0 - margin, lon1 + margin) if x_asc else slice(lon1 + margin, lon0 - margin)
-        ys = slice(lat0 - margin, lat1 + margin) if y_asc else slice(lat1 + margin, lat0 - margin)
-        rsub = raster.sel(x=xs, y=ys)
-        ny, nx = rsub.sizes["y"], rsub.sizes["x"]
-        stride = max(1, int(np.ceil(max(ny, nx) / TARGET_PX)))
-        rsub = rsub.isel(x=slice(None, None, stride), y=slice(None, None, stride)).compute()
-        hsub = hm.sel(x=rsub.x, y=rsub.y, method="nearest").compute()
-        vals = rsub.values.astype("float32")
-        ocean = ~(hsub.values > -1e30)
-        vals[ocean] = np.nan
-        vals[(vals < 0) | (vals > 4)] = np.nan
-        return rsub.x.values, rsub.y.values, vals
 
-    def render(name, slug, bbox, x, y, vals):
-        fig = plt.figure(figsize=(9, 7))
-        ax = fig.add_subplot(projection=ccrs.Robinson())
-        ax.set_facecolor(OCEAN)
-        ax.pcolormesh(
-            x, y, vals, transform=ccrs.PlateCarree(), cmap=cmap, norm=norm,
-            shading="auto", rasterized=True,
-        )
-        ax.set_extent(list(bbox), crs=ccrs.PlateCarree())
-        ax.spines["geo"].set_edgecolor("black")
-        ax.spines["geo"].set_linewidth(0.4)
-        ax.set_title(name, fontsize=13)
-        handles = [Patch(facecolor=c, edgecolor="0.3", linewidth=0.3, label=lab)
-                   for c, lab in zip(class_colors, class_labels)]
-        ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5),
-                  fontsize=7, frameon=False, handlelength=1.2, handleheight=1.2,
-                  borderaxespad=0.0)
-        out = OUT / f"figS6_{slug}.png"
-        fig.savefig(out, dpi=config.DPI_PLOT, bbox_inches="tight")
-        plt.close(fig)
-        return out
+# Risk-class column stems, centre -> rim in the radial and left -> right in
+# every legend. Kept in one place so the CSV, the radial and the classifier
+# cannot drift apart.
+#
+# Every area the CSV reports is km2 and says so in its name; the derived shares
+# keep the bare stem with a pct_ prefix, since a percentage has no unit.
+RISK_KEYS = ('p_low', 'p_mid', 'p_high')
+RISK_COLS = {
+    'p_low': 'natural_unprot_p_lt025',
+    'p_mid': 'natural_unprot_p_025_50',
+    'p_high': 'natural_unprot_p_gt50',
+}
+RISK_AREA_COLS = {k: f'{v}_km2' for k, v in RISK_COLS.items()}
+STACK_KEYS = ('protected',) + RISK_KEYS + ('non_natural',)
+STACK_PCT = {
+    'protected': 'pct_protected',
+    'p_low': 'pct_natural_unprot_p_lt025',
+    'p_mid': 'pct_natural_unprot_p_025_50',
+    'p_high': 'pct_natural_unprot_p_gt50',
+    'non_natural': 'pct_unprot_nonnatural_2020',
+}
 
-    raster, hm = load_layers()
-    for slug, (name, bbox) in config.REGIONS.items():
-        x, y, vals = subset_region(raster, hm, bbox)
-        out = render(name, slug, bbox, x, y, vals)
-        print(f"  saved {out.name}  ({vals.shape[0]}x{vals.shape[1]} cells)", flush=True)
+
+def protection_target_class(pct_protected, pct_low, pct_mid, pct_high,
+                            target=None):
+    """Risk that an ecoregion cannot reach `target`% protection on natural land.
+
+    The five classes, tested in this order:
+
+      already met                 already at or above the target in 2020
+      infeasible on natural land  even all remaining natural land is not enough
+      feasible                    the target fits inside land at P(loss) < 0.025
+      tight                       it also needs land at 0.025 <= P(loss) < 0.5
+      at risk                     it needs land at P(loss) >= 0.5
+
+    `pct_low`, `pct_mid` and `pct_high` are the three risk classes of NATURAL,
+    UNPROTECTED land, as percentages of the ecoregion. Kept as a scalar
+    function so the boundaries are directly testable; 830 ecoregions is far too
+    few for the loop to matter.
+    """
+    if target is None:
+        target = config.PROTECTION_TARGET
+    if pct_protected >= target:
+        return 'already met'
+    if pct_protected + pct_low + pct_mid + pct_high < target:
+        return 'infeasible on natural land'
+    if pct_protected + pct_low >= target:
+        return 'feasible'
+    if pct_protected + pct_low + pct_mid >= target:
+        return 'tight'
+    return 'at risk'
+
+
+def plot_realm_radial(stats, out_path):
+    import matplotlib.patches as mpatches
+
+    """One radial per realm; each arm is one ecoregion, split five ways.
+
+    The five segments partition the ecoregion exactly - protected, the
+    three risk classes of unprotected natural land, and land that was
+    already non-natural in 2020 - so the arms reach the rim by
+    construction. The old version derived its grey band as
+    "100 minus everything else", which cannot fail to close and therefore
+    checked nothing.
+    """
+    stats = stats[stats['REALM'] != 'Antarctica'].copy()
+
+    realm_totals = stats.groupby('REALM')['eco_land_km2'].sum().sort_values(ascending=False)
+    realms = realm_totals.index.tolist()
+
+    biomes_in_data = (
+        stats[['BIOME_NUM', 'BIOME_NAME']]
+        .drop_duplicates()
+        .sort_values('BIOME_NUM')
+        .reset_index(drop=True)
+    )
+
+    nrows, ncols = 2, 4
+    fig, axes = plt.subplots(nrows, ncols, figsize=(17, 10.5),
+                             subplot_kw=dict(projection='polar'),
+                             gridspec_kw=dict(hspace=0.05, wspace=0.05))
+    axes = axes.flatten()
+
+    r_base = 0.05
+    label_radius = 1.12
+    for i in range(nrows * ncols):
+        ax = axes[i]
+        if i >= len(realms):
+            ax.set_visible(False)
+            continue
+        realm = realms[i]
+        df_r = stats[stats['REALM'] == realm]
+        n_arms = len(df_r)
+        if n_arms == 0:
+            ax.set_visible(False)
+            continue
+
+        biomes_here = sorted(df_r['BIOME_NUM'].unique())
+        n_biomes = len(biomes_here)
+        n_slots = n_arms + n_biomes  # 1 arm-width gap per biome group
+        arm_w = 2.0 * np.pi / n_slots
+
+        cursor = 0.0
+        for biome_num in biomes_here:
+            sub = df_r[df_r['BIOME_NUM'] == biome_num].sort_values(
+                by=['pct_protected', 'eco_land_km2'], ascending=[False, False]
+            )
+            n = len(sub)
+            thetas = cursor + arm_w * (np.arange(n) + 0.5)
+
+            bottom = np.full(n, r_base)
+            for key in STACK_KEYS:
+                h = (sub[STACK_PCT[key]] / 100.0).values
+                ax.bar(thetas, h, width=arm_w * 0.95, bottom=bottom,
+                       color=config.RADIAL_COLORS[key], linewidth=0,
+                       align='center')
+                bottom = bottom + h
+
+            # 30%-of-the-bar reference arc, contained within this biome group
+            arc_r = r_base + config.PROTECTION_TARGET / 100.0
+            arc_theta = np.linspace(cursor, cursor + arm_w * n, 64)
+            ax.plot(arc_theta, np.full_like(arc_theta, arc_r),
+                    color='black', alpha=0.6, linewidth=1.0, zorder=5)
+
+            theta_centre = cursor + arm_w * n / 2.0
+            ax.text(theta_centre, label_radius, str(int(biome_num)),
+                    ha='center', va='center', fontsize=8, fontweight='bold',
+                    color='black')
+
+            cursor += arm_w * (n + 1)  # +1 arm-width gap to next biome
+
+        ax.set_ylim(0.0, label_radius + 0.1)
+        ax.set_yticks([])
+        ax.set_xticks([])
+        ax.spines['polar'].set_visible(False)
+        ax.set_theta_zero_location('N')
+        ax.set_theta_direction(-1)
+        ax.set_title(f"{realm}", fontsize=12, pad=10)
+
+    for j in range(len(realms), len(axes)):
+        axes[j].set_visible(False)
+
+    color_patches = [
+        mpatches.Patch(color=config.RADIAL_COLORS[k],
+                       label=config.RADIAL_LABELS[k])
+        for k in STACK_KEYS
+    ] + [plt.Line2D([0], [0], color='black', alpha=0.6, linewidth=1.0,
+                    label=f'{config.PROTECTION_TARGET:g}% target')]
+    fig.legend(handles=color_patches, loc='lower center', ncol=3,
+               frameon=False, fontsize=11, bbox_to_anchor=(0.5, 0.125))
+
+    biome_handles = [
+        mpatches.Patch(facecolor='none', edgecolor='none',
+                       label=f"{int(b.BIOME_NUM)} - {b.BIOME_NAME}")
+        for _, b in biomes_in_data.iterrows()
+    ]
+    fig.legend(handles=biome_handles, loc='lower center',
+               bbox_to_anchor=(0.5, 0.01),
+               ncol=3, fontsize=9, frameon=False,
+               handlelength=0, handletextpad=0,
+               title='Biome key', title_fontsize=10)
+
+    # subplots_adjust rather than tight_layout: polar axes are not tight_layout
+    # compatible (matplotlib says so), so the reserved rect was not honoured and
+    # the six-entry colour legend rode up over the bottom row of dials. The old
+    # four-entry legend fitted on one line and hid the problem.
+    fig.subplots_adjust(left=0.02, right=0.98, top=0.95, bottom=0.235,
+                        hspace=0.26, wspace=0.05)
+    fig.savefig(out_path, dpi=config.DPI_PLOT, bbox_inches='tight',
+                facecolor='white')
+    plt.close(fig)
+    print(f"  saved {out_path.name}")
 
 
 def fig10():
-    """Figure 10: unprotected intact-lands loss 2020->2040 (maps + radials) + stats CSV.
+    """Figure 10: the 30% protection target against forecast loss risk.
 
-    Also writes unprotected_loss_stats.csv, consumed by tables_s1_s8().
+    Writes two CSVs and two figures.
+
+    What changed. The old version ran the whole analysis twice, once on the
+    central 2040 surface and once on the upper, and emitted a map and a radial
+    for each. "Upper" was never a scenario: it was the 97.5th percentile of
+    each pixel's own distribution, so a map of it showed the area that would be
+    lost only if every pixel realised its unlucky outcome together. There is
+    now one analysis, and unprotected natural land is split by its probability
+    of loss instead of by which surface crossed a threshold.
+
+    Outputs:
+      unprotected_loss_stats.csv  per-ecoregion protection and loss-risk shares
+      realm_loss_stats.csv        per-ecoregion expected loss by year (Tables S1-S8)
+      fig_unprotected_loss_radial.png
+      fig_unprotected_loss_map.png
     """
-    import contextlib
     import gc
     import os
     import matplotlib.patches as mpatches
@@ -1633,223 +1857,131 @@ def fig10():
     OUT.mkdir(parents=True, exist_ok=True)
     DATA = config.DATA_DIR
     PATH_HM_2020 = config.PATHS['hm_observed_2020']
-    PATH_HM_CENTRAL = config.PATHS['hm_central_2040']
-    PATH_HM_UPPER = config.PATHS['hm_upper_2040']
     PATH_PA = config.PATHS['hm_static_iucn_strict']
     PATH_ECO = DATA / 'Ecoregions2017' / 'Ecoregions2017.shp'
 
-    INTACT_THRESHOLD = 0.1
     PROTECTED_VALUE = 1.0
-    COARSEN = 4
-
-    COLOR_PROTECTED = '#a8e47e'
-    COLOR_REDBROWN = '#a28181'
-    COLOR_LOST = '#e99060'
-    COLOR_PERSISTENT = '#c0c0c0'
+    P_LOW, P_HIGH = config.P_LOSS_BREAKS
+    COLOR_OCEAN = config.OCEAN_HEX
     COLOR_LAND_BASE = '#E0E0E0'
-    COLOR_OCEAN = '#F4FCFF'
 
     def _analysis_grid():
         """The shared equal-area grid, derived once from the PA raster.
 
-        Every zonal count below is a tally of cells on this grid, so on an
-        equal-area CRS a count IS an area - which is what the CSV's pct_*
-        columns and the Tables S1-S8 captions have always claimed. On the
-        native EPSG:4326 grid they were pixel counts, over-weighting the
-        poleward end of every latitudinally-elongated ecoregion.
+        Every zonal quantity below is a sum over cells on this grid, so on an
+        equal-area CRS a sum of probabilities times cell area IS an expected
+        area - which is what the CSV's columns and the Tables S1-S8 captions
+        claim. On the native EPSG:4326 grid they would be pixel sums,
+        over-weighting the poleward end of every elongated ecoregion.
         """
         with rasterio.open(PATH_PA) as ref:
             return utils.equal_area_grid(ref)
 
-
-    def _load_raster(path: Path, grid) -> xr.DataArray:
+    def _load_raster(path, grid, *, clamp=(0.0, 1.0)):
         """Load `path` onto the equal-area analysis grid.
 
-        All four fig10 inputs are float32, so the default NaN fill applies; the
-        0-1 clamp then also neutralises the +/-3.4e38 nodata these files
-        disagree about.
+        All fig10 inputs are float32, so the default NaN fill applies; the 0-1
+        clamp then also neutralises the +/-3.4e38 nodata these files disagree
+        about. Warping here rather than reading natively is also what makes the
+        probability rasters line up with the HM base masks - they carry
+        coordinates from a different toolchain and would not align natively
+        (see utils.align_like).
         """
         with contextlib.ExitStack() as stack:
             da = utils.open_equal_area_da(stack, path, grid)
-            da = da.where((da >= 0.0) & (da <= 1.0))
+            if clamp is not None:
+                da = da.where((da >= clamp[0]) & (da <= clamp[1]))
             da.load()      # materialise before the VRT closes
         return da
 
-
-    def _summary(name: str, mask: np.ndarray) -> None:
+    def _summary(name, mask):
         n = int(mask.sum())
         km2 = n * (config.EQUAL_AREA_RES / 1000.0) ** 2
         unit = f"cells = {km2:,.0f} km2" if config.EQUAL_AREA_CRS else "pixels"
         print(f"  {name}: {n:,} {unit}")
 
+    def plot_target_map(eco_id, class_of, land_mask, x_coords, y_coords,
+                        out_path, stride=4):
+        """Ecoregions coloured by their risk of missing the 30% target.
 
-    def plot_loss_map(lost_mask: np.ndarray, land_mask: np.ndarray,
-                      x_coords: np.ndarray, y_coords: np.ndarray,
-                      out_path: Path) -> None:
-        # Ternary encoding so we can coarsen the three states in one .max() pass:
-        # 0 = ocean, 1 = land but not lost, 2 = lost. .max() preserves the highest-priority class.
-        combined = land_mask.astype(np.uint8)
-        combined[lost_mask] = 2
-        da = xr.DataArray(combined, dims=('y', 'x'),
-                          coords={'x': x_coords, 'y': y_coords})
-        da = da.coarsen(x=COARSEN, y=COARSEN, boundary='trim').max()
-        coarse = da.values
-        x_c = da['x'].values
-        y_c = da['y'].values
+        Decimated by striding rather than coarsening: the values are class ids,
+        and a mean or a maximum of two class ids is not a class. Ecoregions are
+        far larger than four cells, so striding costs nothing visually. The
+        stride is applied to the ids *before* they are mapped to classes, which
+        also avoids building a second full-grid array.
+        """
+        land = land_mask[::stride, ::stride]
+        cls = class_of[eco_id[::stride, ::stride]]
+        y_c = y_coords[::stride]
+        # Trim the columns that straddle the antimeridian; cartopy draws those
+        # quads across the whole map. See utils.trim_wrapped_columns.
+        x_c, cls, land = utils.trim_wrapped_columns(
+            x_coords[::stride], cls, land)
 
-        # NaN where ocean so set_facecolor shows through; 0/1 for the cmap stops.
-        display = np.where(coarse == 0, np.nan,
-                           np.where(coarse == 2, 1.0, 0.0)).astype(np.float32)
-
-        cmap = mcolors.LinearSegmentedColormap.from_list(
-            'loss_cmap', [COLOR_LAND_BASE, COLOR_LOST]
-        )
-        cmap.set_bad(color=COLOR_OCEAN, alpha=0.0)  # ocean = transparent → ax facecolor shows
+        labels = list(config.TARGET_CLASSES)
+        cmap = mcolors.ListedColormap(
+            [config.TARGET_CLASS_COLORS[c] for c in labels])
+        cmap.set_bad(COLOR_OCEAN, alpha=0.0)
+        norm = mcolors.BoundaryNorm(np.arange(-0.5, len(labels) + 0.5), cmap.N)
 
         fig = plt.figure(figsize=(13, 7))
         ax = plt.axes(projection=ccrs.Robinson())
         ax.set_global()
         ax.set_facecolor(COLOR_OCEAN)
 
-        # The masks now live on the equal-area analysis grid, so the source
-        # transform must match it; Robinson still handles the display.
         src_crs = (ccrs.epsg(config.EQUAL_AREA_CRS.split(':')[1])
                    if config.EQUAL_AREA_CRS else ccrs.PlateCarree())
-        ax.pcolormesh(
-            x_c, y_c, display,
-            cmap=cmap, vmin=0.0, vmax=1.0,
-            transform=src_crs,
-            shading='nearest',
-            rasterized=True,
-        )
+
+        # Land with no ecoregion (non-terrestrial biomes, unmapped coast) still
+        # has to read as land rather than as ocean.
+        ax.pcolormesh(x_c, y_c, np.where(land, 1.0, np.nan),
+                      cmap=mcolors.ListedColormap([COLOR_LAND_BASE]),
+                      vmin=0.0, vmax=1.0, transform=src_crs,
+                      shading='nearest', rasterized=True, zorder=1)
+        # Masked to land. Several Ecoregions2017 polygons wrap the pole, and in
+        # a cylindrical equal-area projection a polar cap becomes a band across
+        # every longitude - so an unmasked class layer paints a stripe of
+        # "feasible" ecoregion straight across the Arctic Ocean. Every number in
+        # the CSV is computed on land_mask; the map has to agree with it.
+        ax.pcolormesh(x_c, y_c,
+                      np.where((cls >= 0) & land, cls, np.nan).astype(np.float32),
+                      cmap=cmap, norm=norm, transform=src_crs,
+                      shading='nearest', rasterized=True, zorder=2)
 
         ax.spines['geo'].set_visible(True)
         ax.spines['geo'].set_edgecolor('black')
         ax.spines['geo'].set_linewidth(0.3)
 
-        fig.savefig(out_path, dpi=config.DPI_MAP, bbox_inches='tight', facecolor='white')
+        def legend_label(c):
+            """Class description, prefixed by the class name only where needed.
+
+            Three of the five descriptions already read as complete labels
+            ("Target met on land with P(loss) < 0.025"), so the prefix only
+            restated them in shorthand. The other two do not stand alone.
+            """
+            d = config.TARGET_CLASS_DESCRIPTIONS[c]
+            if c in config.TARGET_CLASS_LABEL_PREFIX:
+                return f'{c.capitalize()} - {d}'
+            return d[0].upper() + d[1:]
+
+        handles = [
+            mpatches.Patch(color=config.TARGET_CLASS_COLORS[c],
+                           label=legend_label(c))
+            for c in labels
+        ]
+        ax.legend(handles=handles, loc='lower center', ncol=2, frameon=False,
+                  fontsize=9, bbox_to_anchor=(0.5, -0.16))
+        fig.suptitle(
+            f'Risk of missing a {config.PROTECTION_TARGET:g}% protection '
+            f'target on land natural in 2020', fontsize=13, y=0.95)
+
+        fig.savefig(out_path, dpi=config.DPI_MAP, bbox_inches='tight',
+                    facecolor='white')
         plt.close(fig)
         print(f"  saved {out_path.name}")
 
-
-    def plot_realm_radial(stats: pd.DataFrame, forecast: str, out_path: Path) -> None:
-        pct_p_col = 'pct_protected'                       # static, no forecast suffix
-        pct_rb_col = f'pct_red_brown_{forecast}'
-        pct_l_col = f'pct_lost_{forecast}'
-
-        # Drop Antarctica per request
-        stats = stats[stats['REALM'] != 'Antarctica'].copy()
-
-        realm_totals = stats.groupby('REALM')['eco_land_total'].sum().sort_values(ascending=False)
-        realms = realm_totals.index.tolist()
-
-        # Biomes present anywhere in the data (numbered key for the figure legend)
-        biomes_in_data = (
-            stats[['BIOME_NUM', 'BIOME_NAME']]
-            .drop_duplicates()
-            .sort_values('BIOME_NUM')
-            .reset_index(drop=True)
-        )
-
-        nrows, ncols = 2, 4
-        fig, axes = plt.subplots(nrows, ncols, figsize=(17, 10.5),
-                                 subplot_kw=dict(projection='polar'),
-                                 gridspec_kw=dict(hspace=0.05, wspace=0.05))
-        axes = axes.flatten()
-
-        r_base = 0.05
-        label_radius = 1.12
-        for i in range(nrows * ncols):
-            ax = axes[i]
-            if i >= len(realms):
-                ax.set_visible(False)
-                continue
-            realm = realms[i]
-            df_r = stats[stats['REALM'] == realm]
-            n_arms = len(df_r)
-            if n_arms == 0:
-                ax.set_visible(False)
-                continue
-
-            biomes_here = sorted(df_r['BIOME_NUM'].unique())
-            n_biomes = len(biomes_here)
-            n_slots = n_arms + n_biomes  # 1 arm-width gap per biome group
-            arm_w = 2.0 * np.pi / n_slots
-
-            cursor = 0.0
-            for biome_num in biomes_here:
-                sub = df_r[df_r['BIOME_NUM'] == biome_num].sort_values(
-                    by=[pct_p_col, 'eco_land_total'], ascending=[False, False]
-                )
-                n = len(sub)
-                thetas = cursor + arm_w * (np.arange(n) + 0.5)
-                p = (sub[pct_p_col] / 100.0).values
-                rb = (sub[pct_rb_col] / 100.0).values
-                l = (sub[pct_l_col] / 100.0).values
-                grey = np.clip(1.0 - p - rb - l, 0.0, 1.0)
-
-                # Stack order (centre → rim): protected, grey, lost, red-brown
-                ax.bar(thetas, p, width=arm_w * 0.95, bottom=r_base,
-                       color=COLOR_PROTECTED, linewidth=0, align='center')
-                ax.bar(thetas, grey, width=arm_w * 0.95, bottom=r_base + p,
-                       color=COLOR_PERSISTENT, linewidth=0, align='center')
-                ax.bar(thetas, l, width=arm_w * 0.95, bottom=r_base + p + grey,
-                       color=COLOR_LOST, linewidth=0, align='center')
-                ax.bar(thetas, rb, width=arm_w * 0.95, bottom=r_base + p + grey + l,
-                       color=COLOR_REDBROWN, linewidth=0, align='center')
-
-                # 30%-of-the-bar reference arc, contained within this biome group
-                arc_r = r_base + 0.30
-                arc_theta = np.linspace(cursor, cursor + arm_w * n, 64)
-                ax.plot(arc_theta, np.full_like(arc_theta, arc_r),
-                        color='black', alpha=0.5, linewidth=1.0, zorder=5)
-
-                theta_centre = cursor + arm_w * n / 2.0
-                ax.text(theta_centre, label_radius, str(int(biome_num)),
-                        ha='center', va='center', fontsize=8, fontweight='bold',
-                        color='black')
-
-                cursor += arm_w * (n + 1)  # +1 arm-width gap to next biome
-
-            ax.set_ylim(0.0, label_radius + 0.1)
-            ax.set_yticks([])
-            ax.set_xticks([])
-            ax.spines['polar'].set_visible(False)
-            ax.set_theta_zero_location('N')
-            ax.set_theta_direction(-1)
-            ax.set_title(f"{realm}", fontsize=12, pad=10)
-
-        for j in range(len(realms), len(axes)):
-            axes[j].set_visible(False)
-
-        color_patches = [
-            mpatches.Patch(color=COLOR_PROTECTED, label='Protected'),
-            mpatches.Patch(color=COLOR_LOST, label='Natural lands loss 2040'),
-            mpatches.Patch(color=COLOR_PERSISTENT, label='Still natural 2040'),
-            mpatches.Patch(color=COLOR_REDBROWN, label='Non-natural 2020'),
-        ]
-        fig.legend(handles=color_patches, loc='lower center', ncol=4,
-                   frameon=False, fontsize=11, bbox_to_anchor=(0.5, 0.115))
-
-        biome_handles = [
-            mpatches.Patch(facecolor='none', edgecolor='none',
-                           label=f"{int(b.BIOME_NUM)} — {b.BIOME_NAME}")
-            for _, b in biomes_in_data.iterrows()
-        ]
-        fig.legend(handles=biome_handles, loc='lower center',
-                   bbox_to_anchor=(0.5, 0.015),
-                   ncol=3, fontsize=9, frameon=False,
-                   handlelength=0, handletextpad=0,
-                   title='Biome key', title_fontsize=10)
-
-        fig.tight_layout(rect=[0.0, 0.20, 1.0, 0.98])
-        fig.savefig(out_path, dpi=config.DPI_PLOT, bbox_inches='tight', facecolor='white')
-        plt.close(fig)
-        print(f"  saved {out_path.name}")
-
-
-    def main() -> None:
-        print("=== plot_unprotected_loss.py ===")
+    def main():
+        print("=== fig10: protection target vs forecast loss risk ===")
         OUT.mkdir(parents=True, exist_ok=True)
 
         # [0] Equal-area analysis grid, shared by every layer and the ecoregions
@@ -1859,7 +1991,7 @@ def fig10():
                   f"{config.EQUAL_AREA_RES} m -> {grid[2]:,} x {grid[1]:,} cells")
 
         # [1] Protected areas
-        print("[1] Loading protected-area raster…")
+        print("[1] Loading protected-area raster...")
         pa_da = _load_raster(PATH_PA, grid)
         transform = pa_da.rio.transform()
         shape = pa_da.shape
@@ -1869,72 +2001,32 @@ def fig10():
         del pa_da
         _summary("protected", protected)
 
-        # [2] HM 2020
-        print("[2] Loading HM 2020…")
+        # [2] HM 2020 -> the three 2020 condition classes
+        print("[2] Loading HM 2020...")
         hm_2020 = _load_raster(PATH_HM_2020, grid)
-        hm_2020_vals = hm_2020.values
-        land_mask = np.isfinite(hm_2020_vals)
-        intact_2020 = (hm_2020_vals < INTACT_THRESHOLD) & land_mask
-        del hm_2020, hm_2020_vals
+        hm_vals = hm_2020.values
+        land_mask = np.isfinite(hm_vals)
+        # Closed at the bottom: natural is HM <= 0.10, so the two classes stay
+        # disjoint and partition the land with the rest. See config.LOW_CUT.
+        natural_2020 = (hm_vals <= config.LOW_CUT) & land_mask
+        mid_2020 = ((hm_vals > config.LOW_CUT) & (hm_vals < config.HIGH_CUT)
+                    & land_mask)
+        del hm_2020, hm_vals
         _summary("land", land_mask)
-        _summary("intact_2020", intact_2020)
+        _summary("natural_2020", natural_2020)
+        _summary("moderately_modified_2020", mid_2020)
 
-        protected_land = protected & land_mask                     # green numerator
-        intact_unprotected = intact_2020 & ~protected
-        unprot_nonintact_2020 = land_mask & ~protected & ~intact_2020  # used to derive red-brown
+        protected_land = protected & land_mask
+        natural_unprotected = natural_2020 & ~protected
+        unprot_nonnatural_2020 = land_mask & ~protected & ~natural_2020
         _summary("protected_land", protected_land)
-        _summary("intact_unprotected", intact_unprotected)
-        _summary("unprot_nonintact_2020", unprot_nonintact_2020)
+        _summary("natural_unprotected", natural_unprotected)
+        _summary("unprot_nonnatural_2020", unprot_nonnatural_2020)
         del protected
         gc.collect()
 
-        # [3] HM central
-        print("[3] Loading HM central 2040…")
-        hm_c = _load_raster(PATH_HM_CENTRAL, grid)
-        hm_c_vals = hm_c.values
-        lost_central = intact_unprotected & (hm_c_vals >= INTACT_THRESHOLD)
-        red_brown_central = unprot_nonintact_2020 & (hm_c_vals >= INTACT_THRESHOLD)
-        del hm_c, hm_c_vals
-        gc.collect()
-        _summary("lost_central", lost_central)
-        _summary("red_brown_central", red_brown_central)
-
-        # [4] Map central
-        skip_maps = os.environ.get('SKIP_MAPS') == '1'
-        if not skip_maps:
-            print("[4] Rendering map central…")
-            plot_loss_map(lost_central, land_mask, x_coords, y_coords,
-                          out_path=OUT / 'fig_unprotected_loss_map_central.png')
-        else:
-            print("[4] SKIP_MAPS=1, skipping map central")
-
-        # [5] HM upper
-        print("[5] Loading HM upper 2040…")
-        hm_u = _load_raster(PATH_HM_UPPER, grid)
-        hm_u_vals = hm_u.values
-        lost_upper = intact_unprotected & (hm_u_vals >= INTACT_THRESHOLD)
-        red_brown_upper = unprot_nonintact_2020 & (hm_u_vals >= INTACT_THRESHOLD)
-        del hm_u, hm_u_vals, unprot_nonintact_2020
-        gc.collect()
-        _summary("lost_upper", lost_upper)
-        _summary("red_brown_upper", red_brown_upper)
-        assert lost_upper.sum() >= lost_central.sum(), \
-            "Sanity check failed: lost_upper should be >= lost_central"
-        assert red_brown_upper.sum() >= red_brown_central.sum(), \
-            "Sanity check failed: red_brown_upper should be >= red_brown_central"
-
-        # [6] Map upper
-        if not skip_maps:
-            print("[6] Rendering map upper…")
-            plot_loss_map(lost_upper, land_mask, x_coords, y_coords,
-                          out_path=OUT / 'fig_unprotected_loss_map_upper.png')
-        else:
-            print("[6] SKIP_MAPS=1, skipping map upper")
-        # land_mask is kept — it's the denominator (total ecoregion area) in zonal stats.
-        gc.collect()
-
-        # [7] Rasterize ecoregions
-        print("[7] Rasterizing ecoregions…")
+        # [3] Rasterize ecoregions, before any probability layer is resident
+        print("[3] Rasterizing ecoregions...")
         eco = gpd.read_file(str(PATH_ECO), encoding='latin1')
         eco = eco[eco['REALM'].notna() & (eco['REALM'].astype(str) != 'N/A')].reset_index(drop=True)
         if config.EQUAL_AREA_CRS:
@@ -1950,81 +2042,226 @@ def fig10():
         shapes_iter = ((g, int(i)) for g, i in zip(eco.geometry, eco['idx']))
         eco_id = rasterize(shapes_iter, out_shape=shape, transform=transform,
                            fill=0, dtype='uint16', all_touched=False)
-        flat_id = eco_id.ravel()
         N = len(eco)
-        del eco_id
         gc.collect()
 
-        # [8] Zonal stats
-        print("[8] Computing zonal stats…")
+        def zonal_sum(values, chunk_rows=2048):
+            """Sum `values` within each ecoregion.
 
-        def zonal_sum(mask: np.ndarray) -> np.ndarray:
-            return np.bincount(flat_id, weights=mask.ravel().astype(np.float32),
-                               minlength=N + 1)[1:]
+            Row-chunked because np.bincount promotes its weights to float64: a
+            whole-grid call would materialise a 4 GB temporary on top of
+            everything already resident.
+            """
+            out = np.zeros(N + 1, dtype=np.float64)
+            for r0 in range(0, values.shape[0], chunk_rows):
+                sl = slice(r0, min(r0 + chunk_rows, values.shape[0]))
+                out += np.bincount(
+                    eco_id[sl].ravel(),
+                    weights=np.asarray(values[sl], dtype=np.float64).ravel(),
+                    minlength=N + 1)
+            return out[1:]
 
-        # Forecast-independent "unprotected & non-natural in 2020" mask (used for the
-        # table export's single 'Non-natural 2020' column).
-        unprot_nonnatural_2020 = land_mask & ~protected_land & ~intact_2020
+        def prob_weights(p, base):
+            """p where the base admits it and the layer resolves, else 0."""
+            return np.where(base & np.isfinite(p), p, 0.0)
 
-        stats = pd.DataFrame({
+        # [4] Loss-risk classes on unprotected natural land, from p10 in the
+        #     final forecast year. This is the layer the protection target is
+        #     judged against.
+        last = config.FORECAST_YEARS[-1]
+        print(f"[4] Loading P(HM >= {config.LOW_CUT:g}) for {last}...")
+        p10_last = _load_raster(config.PATHS[f'hm_p10_{last}'], grid)
+        p10_vals = p10_last.values
+        del p10_last
+
+        resolved = np.isfinite(p10_vals)
+        risk = {
+            'p_low': natural_unprotected & resolved & (p10_vals < P_LOW),
+            'p_mid': natural_unprotected & resolved & (p10_vals >= P_LOW)
+                     & (p10_vals < P_HIGH),
+            'p_high': natural_unprotected & resolved & (p10_vals >= P_HIGH),
+        }
+        # Cells the probability layer cannot resolve are reported, not absorbed
+        # into a risk class, or the closure check below would be meaningless.
+        natural_unprot_nodata = natural_unprotected & ~resolved
+        for k in RISK_KEYS:
+            _summary(k, risk[k])
+        _summary("natural_unprot_nodata", natural_unprot_nodata)
+
+        print("[5] Zonal sums...")
+        # Every zonal sum below is a count of analysis cells, and on the
+        # equal-area grid one cell is one constant patch of ground - so
+        # multiplying by the cell area turns each into km2 here, once, and every
+        # area this function reports is km2 from this point on. The percentages
+        # further down are ratios of these, so the scaling cancels out of them.
+        cell_km2 = (config.EQUAL_AREA_RES / 1000.0) ** 2
+        if not config.EQUAL_AREA_CRS:
+            print("  WARNING: EQUAL_AREA_CRS is None, so these sums are native "
+                  "EPSG:4326 pixel counts and the _km2 columns are mislabelled.")
+
+        def zonal_km2(values):
+            return zonal_sum(values) * cell_km2
+
+        columns = {
             'idx': eco['idx'].values,
             'REALM': eco['REALM'].values,
             'ECO_NAME': eco['ECO_NAME'].values,
             'BIOME_NUM': eco['BIOME_NUM'].astype(int).values,
             'BIOME_NAME': eco['BIOME_NAME'].values,
-            'eco_land_total': zonal_sum(land_mask),
-            'protected_land': zonal_sum(protected_land),
-            'intact_total': zonal_sum(intact_2020),  # kept for reference
-            'unprot_nonnatural_2020': zonal_sum(unprot_nonnatural_2020),
-            'red_brown_central': zonal_sum(red_brown_central),
-            'lost_central': zonal_sum(lost_central),
-            'red_brown_upper': zonal_sum(red_brown_upper),
-            'lost_upper': zonal_sum(lost_upper),
-        })
-        del (flat_id, intact_2020, protected_land, intact_unprotected,
-             red_brown_central, lost_central, red_brown_upper, lost_upper,
-             unprot_nonnatural_2020, land_mask)
+            'eco_land_km2': zonal_km2(land_mask),
+            'protected_km2': zonal_km2(protected_land),
+            'natural_km2': zonal_km2(natural_2020),
+            'unprot_nonnatural_2020_km2': zonal_km2(unprot_nonnatural_2020),
+            'natural_unprot_nodata_km2': zonal_km2(natural_unprot_nodata),
+        }
+        for k in RISK_KEYS:
+            columns[RISK_AREA_COLS[k]] = zonal_km2(risk[k])
+
+        # Expected loss by year, for the realm tables. Natural lands lost uses
+        # p10 over land natural in 2020; moderately modified lands lost uses p40
+        # over land between the two cuts. Both are sums of probabilities, so
+        # both are expected areas.
+        loss = {}
+        loss[f'natural_lost_{last}'] = zonal_km2(prob_weights(p10_vals, natural_2020))
+        del p10_vals, risk, resolved
+        gc.collect()
+
+        for year in config.FORECAST_YEARS:
+            if year != last:
+                print(f"[5] P(HM >= {config.LOW_CUT:g}) {year}...")
+                p = _load_raster(config.PATHS[f'hm_p10_{year}'], grid).values
+                loss[f'natural_lost_{year}'] = zonal_km2(prob_weights(p, natural_2020))
+                del p
+                gc.collect()
+            print(f"[5] P(HM >= {config.HIGH_CUT:g}) {year}...")
+            p = _load_raster(config.PATHS[f'hm_p40_{year}'], grid).values
+            loss[f'midmod_lost_{year}'] = zonal_km2(prob_weights(p, mid_2020))
+            del p
+            gc.collect()
+
+        stats = pd.DataFrame(columns)
+        loss_df = pd.DataFrame(loss)
+
+        # [6] Target-risk map, before the big masks are released
+        skip_maps = os.environ.get('SKIP_MAPS') == '1'
+
+        del (natural_2020, mid_2020, protected_land, natural_unprotected,
+             unprot_nonnatural_2020, natural_unprot_nodata)
         gc.collect()
 
         # Drop non-terrestrial biomes (BIOME_NUM 98=Lake, 99=Rock & Ice, etc.)
-        stats = stats[stats['BIOME_NUM'].between(1, 14)].copy()
-        stats = stats[stats['eco_land_total'] > 0].copy()
+        keep = stats['BIOME_NUM'].between(1, 14) & (stats['eco_land_km2'] > 0)
+        loss_df = loss_df[keep.values].copy()
+        stats = stats[keep].copy()
         print(f"  {len(stats)} ecoregions across "
               f"{stats['REALM'].nunique()} realms and "
               f"{stats['BIOME_NUM'].nunique()} biomes")
 
-        # All percentages are of total ecoregion land area. On the equal-area
-        # analysis grid every cell is the same ground area, so these ratios are
-        # true area shares; on the native EPSG:4326 grid they were pixel shares
-        # skewed toward the poleward end of each ecoregion.
-        if config.EQUAL_AREA_CRS:
-            cell_km2 = (config.EQUAL_AREA_RES / 1000.0) ** 2
-            stats['eco_land_km2'] = stats['eco_land_total'] * cell_km2
-        stats['pct_protected'] = 100.0 * stats['protected_land'] / stats['eco_land_total']
+        # All percentages are of total ecoregion land area. Every column they
+        # divide is already km2 on the equal-area grid, so these are true area
+        # shares - and identical to what the old cell-count ratios gave, since
+        # the cell area cancels.
+        total = stats['eco_land_km2']
+        stats['pct_protected'] = 100.0 * stats['protected_km2'] / total
         stats['pct_unprot_nonnatural_2020'] = (
-            100.0 * stats['unprot_nonnatural_2020'] / stats['eco_land_total']
-        )
-        for f in ('central', 'upper'):
-            stats[f'pct_red_brown_{f}'] = 100.0 * stats[f'red_brown_{f}'] / stats['eco_land_total']
-            stats[f'pct_lost_{f}'] = 100.0 * stats[f'lost_{f}'] / stats['eco_land_total']
-            # grey = everything else (still-intact + recovery + tiny HM-2040 NaN gap)
-            stats[f'pct_grey_{f}'] = (100.0 - stats['pct_protected']
-                                      - stats[f'pct_red_brown_{f}']
-                                      - stats[f'pct_lost_{f}'])
+            100.0 * stats['unprot_nonnatural_2020_km2'] / total)
+        for k in RISK_KEYS:
+            stats[f'pct_{RISK_COLS[k]}'] = (
+                100.0 * stats[RISK_AREA_COLS[k]] / total)
+        stats['pct_natural_unprot_nodata'] = (
+            100.0 * stats['natural_unprot_nodata_km2'] / total)
 
-        for f in ('central', 'upper'):
-            s = (stats['pct_protected'] + stats[f'pct_red_brown_{f}']
-                 + stats[f'pct_lost_{f}'] + stats[f'pct_grey_{f}'])
-            assert np.allclose(s, 100.0, atol=0.01), f"closure failed for {f}"
+        # The five stacked shares plus the unresolved remainder partition the
+        # ecoregion, so they must close to 100. Unlike the old "grey =
+        # 100 - everything else" this can actually fail, which is the point.
+        closure = (stats[[STACK_PCT[k] for k in STACK_KEYS]].sum(axis=1)
+                   + stats['pct_natural_unprot_nodata'])
+        assert np.allclose(closure, 100.0, atol=0.01), (
+            'ecoregion shares do not close to 100%: '
+            f'worst is {float((closure - 100.0).abs().max()):.4f} points')
+        nodata_pct = float(stats['pct_natural_unprot_nodata'].max())
+        print(f"  closure check passed; largest unresolved share in any "
+              f"ecoregion is {nodata_pct:.4f}%")
 
-        stats.to_csv(OUT / 'unprotected_loss_stats.csv', index=False)
-        print(f"  saved unprotected_loss_stats.csv")
+        stats['target_class'] = [
+            protection_target_class(r.pct_protected,
+                                    r.pct_natural_unprot_p_lt025,
+                                    r.pct_natural_unprot_p_025_50,
+                                    r.pct_natural_unprot_p_gt50)
+            for r in stats.itertuples()
+        ]
+        counts = stats['target_class'].value_counts()
+        print(f"  {config.PROTECTION_TARGET:g}% target: "
+              + ', '.join(f'{c} {counts.get(c, 0)}'
+                          for c in config.TARGET_CLASSES))
 
-        # [9-10] Radial plots
-        print("[9] Rendering radial central…")
-        plot_realm_radial(stats, 'central', OUT / 'fig_unprotected_loss_radial_central.png')
-        print("[10] Rendering radial upper…")
-        plot_realm_radial(stats, 'upper', OUT / 'fig_unprotected_loss_radial_upper.png')
+        csv_cols = [
+            'idx', 'REALM', 'ECO_NAME', 'BIOME_NUM', 'BIOME_NAME',
+            'eco_land_km2', 'protected_km2', 'natural_km2',
+            'unprot_nonnatural_2020_km2',
+            *[RISK_AREA_COLS[k] for k in RISK_KEYS],
+            'natural_unprot_nodata_km2',
+            'pct_protected', 'pct_unprot_nonnatural_2020',
+            *[f'pct_{RISK_COLS[k]}' for k in RISK_KEYS],
+            'pct_natural_unprot_nodata', 'target_class',
+        ]
+        stats[[c for c in csv_cols if c in stats.columns]].to_csv(
+            OUT / 'unprotected_loss_stats.csv', index=False)
+        print("  saved unprotected_loss_stats.csv")
+
+        # Expected areas for the realm tables. These were hectares, which put a
+        # whole-ecoregion total at nine digits beside six-digit losses; km2
+        # throughout keeps the table readable and matches every other area the
+        # repo reports.
+        realm = stats[['idx', 'REALM', 'ECO_NAME', 'BIOME_NUM',
+                       'BIOME_NAME']].reset_index(drop=True)
+        loss_df = loss_df.reset_index(drop=True)
+        # Total ecoregion area, carried through so Tables S1-S8 can print it
+        # beside the ecoregion name.
+        realm['eco_area_km2'] = stats['eco_land_km2'].reset_index(drop=True)
+        for year in config.FORECAST_YEARS:
+            for stem in ('natural_lost', 'midmod_lost'):
+                realm[f'{stem}_{year}_km2'] = loss_df[f'{stem}_{year}']
+        realm.to_csv(OUT / 'realm_loss_stats.csv', index=False)
+        print("  saved realm_loss_stats.csv")
+        print(f"  expected natural lands lost by {last}, all ecoregions: "
+              f"{realm[f'natural_lost_{last}_km2'].sum():,.0f} km2")
+
+        # Ecoregions that cannot reach the target without drawing on land the
+        # model gives better-than-even odds of losing. These are the ones where
+        # the 30% figure and the forecast are in direct conflict, so the list
+        # is printed in full rather than only counted.
+        at_risk = stats[stats['target_class'] == 'at risk'].sort_values(
+            ['REALM', 'ECO_NAME'])
+        head = (f"  ecoregions where the "
+                f"{config.PROTECTION_TARGET:g}% target needs land with "
+                f"P(loss) > {P_HIGH:g}  ({len(at_risk)})")
+        print(head)
+        print("  " + "-" * (len(head) - 2))
+        for r in at_risk.itertuples():
+            print(f"    {r.REALM:<12} {r.ECO_NAME:<58} "
+                  f"protected {r.pct_protected:5.1f}%  "
+                  f"natural unprotected {r.pct_natural_unprot_p_lt025:5.1f}/"
+                  f"{r.pct_natural_unprot_p_025_50:5.1f}/"
+                  f"{r.pct_natural_unprot_p_gt50:5.1f}% "
+                  f"(P<0.025 / 0.025-0.5 / >0.5)")
+        if at_risk.empty:
+            print("    none")
+
+        # [7] Figures
+        if not skip_maps:
+            print("[7] Rendering target-risk map...")
+            class_of = np.full(N + 1, -1, dtype=np.int16)
+            order = {c: i for i, c in enumerate(config.TARGET_CLASSES)}
+            class_of[stats['idx'].to_numpy()] = [
+                order[c] for c in stats['target_class']]
+            plot_target_map(eco_id, class_of, land_mask, x_coords, y_coords,
+                            OUT / 'fig_unprotected_loss_map.png')
+        else:
+            print("[7] SKIP_MAPS=1, skipping target-risk map")
+
+        print("[8] Rendering radial...")
+        plot_realm_radial(stats, OUT / 'fig_unprotected_loss_radial.png')
 
         print("=== done ===")
 
